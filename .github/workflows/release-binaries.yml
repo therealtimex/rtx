@@ -1,18 +1,17 @@
 # Build self-contained `omp` binaries on GitHub-hosted runners and publish them
-# as release assets named `omp-<platform>-<arch>` (the names `scripts/install.sh`
-# downloads). Independent of the upstream `ci.yml`, which builds natives on
-# private `omp-kata` runners.
+# as release assets. Asset names match what the installers download:
+#   scripts/install.sh  -> omp-<darwin|linux>-<x64|arm64>
+#   scripts/install.ps1 -> omp-windows-x64.exe
 #
-# Stages per job (the same flow proven to build locally):
-#   1. Build the Rust napi native(s)  — x64 needs BOTH tiers (modern + baseline),
+# Stages per job (the flow proven to build locally in R1):
+#   1. Build the Rust napi native(s) — x64 needs BOTH tiers (modern + baseline);
 #      arm64 is a single build.
-#   2. `bun run build` (build-binary.ts) embeds the native + Bun runtime → dist/omp.
-#   3. Rename → `omp-<platform>-<arch>`, upload as an artifact, and (on a `v*`
-#      tag) attach to the GitHub release.
+#   2. `bun run build` (build-binary.ts) embeds native + Bun runtime -> dist/omp[.exe].
+#   3. Rename to the asset name, upload as an artifact, and (on a `v*` tag)
+#      attach to the GitHub release.
 #
-# Trigger it manually (Actions → Release omp binaries → Run workflow) to get
-# downloadable artifacts without cutting a release; push a `v*` tag to also
-# publish them as release assets.
+# Run manually (Actions -> Run workflow) for downloadable artifacts, or push a
+# `v*` tag to also publish them as release assets.
 
 name: Release omp binaries
 
@@ -27,20 +26,33 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
+    name: Build ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash # Windows runners use Git Bash so one script works everywhere.
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-14 # Apple Silicon
-            platform: darwin
-            arch: arm64
+            asset: omp-darwin-arm64
             dual_tier: false
-          - os: ubuntu-latest
-            platform: linux
-            arch: x64
+          - os: macos-13 # Intel
+            asset: omp-darwin-x64
             dual_tier: true
+          - os: ubuntu-latest
+            asset: omp-linux-x64
+            dual_tier: true
+            linux: true
+          - os: ubuntu-24.04-arm # GitHub-hosted ARM64 Linux runner
+            asset: omp-linux-arm64
+            dual_tier: false
+            linux: true
+          - os: windows-latest
+            asset: omp-windows-x64.exe
+            dual_tier: true
+            windows: true
 
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +60,7 @@ jobs:
       # arboard (clipboard) and other native crates need X11/XCB dev headers on
       # Linux; without them the napi build fails to link.
       - name: Install Linux native build deps
-        if: matrix.platform == 'linux'
+        if: ${{ matrix.linux }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -66,7 +78,7 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      # x64: build both ISA tiers so the runtime loader always finds its match
+      # x64 builds both ISA tiers so the runtime loader always finds its match
       # (the modern/baseline trap). arm64 has no tier split.
       - name: Build native addon(s)
         working-directory: packages/natives
@@ -84,12 +96,12 @@ jobs:
 
       - name: Stage release asset
         run: |
-          asset="omp-${{ matrix.platform }}-${{ matrix.arch }}"
-          mv packages/coding-agent/dist/omp "$asset"
-          chmod +x "$asset"
-          ls -lh "$asset"
-          file "$asset" || true
-          echo "ASSET_NAME=$asset" >> "$GITHUB_ENV"
+          src="packages/coding-agent/dist/omp"
+          [ "${{ matrix.windows }}" = "true" ] && src="packages/coding-agent/dist/omp.exe"
+          mv "$src" "${{ matrix.asset }}"
+          chmod +x "${{ matrix.asset }}" || true
+          ls -lh "${{ matrix.asset }}"
+          echo "ASSET_NAME=${{ matrix.asset }}" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
