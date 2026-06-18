@@ -569,6 +569,159 @@ function createSimpleAnthropicProviderOptions(
 }
 
 // ---------------------------------------------------------------------------
+// Umans AI Coding Plan
+// ---------------------------------------------------------------------------
+
+const UMANS_BASE_URL = "https://api.code.umans.ai";
+const UMANS_MODELS_INFO_PATH = "/models/info";
+const UMANS_REASONING_EFFORT_BY_LEVEL: Record<string, Effort> = {
+	minimal: Effort.Minimal,
+	low: Effort.Low,
+	medium: Effort.Medium,
+	high: Effort.High,
+	xhigh: Effort.XHigh,
+};
+const UMANS_DEFAULT_REASONING_EFFORTS = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh] as const;
+
+export interface UmansModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+interface UmansModelInfo {
+	name?: unknown;
+	display_name?: unknown;
+	capabilities?: unknown;
+}
+
+function normalizeUmansBaseUrl(baseUrl: string | undefined): string {
+	const normalized = normalizeAnthropicBaseUrl(baseUrl, UMANS_BASE_URL);
+	return normalized.endsWith("/v1") ? normalized.slice(0, -3) : normalized;
+}
+
+function umansSupportsVision(value: unknown): boolean {
+	return value === true || (typeof value === "string" && value.length > 0);
+}
+
+function umansReasoningSupported(value: unknown): boolean {
+	return isRecord(value) ? value.supported === true : value === true;
+}
+
+function mapUmansReasoningEfforts(value: unknown): readonly Effort[] {
+	if (!isRecord(value) || !Array.isArray(value.levels)) {
+		return UMANS_DEFAULT_REASONING_EFFORTS;
+	}
+	const efforts: Effort[] = [];
+	for (const level of value.levels) {
+		if (typeof level !== "string") continue;
+		const effort = UMANS_REASONING_EFFORT_BY_LEVEL[level];
+		if (effort !== undefined && !efforts.includes(effort)) {
+			efforts.push(effort);
+		}
+	}
+	return efforts.length > 0 ? efforts : UMANS_DEFAULT_REASONING_EFFORTS;
+}
+
+function mapUmansThinkingConfig(value: unknown): ThinkingConfig | undefined {
+	if (!umansReasoningSupported(value)) return undefined;
+	const efforts = mapUmansReasoningEfforts(value);
+	const thinking: ThinkingConfig = { mode: "budget", efforts };
+	if (isRecord(value)) {
+		if (value.can_disable === false) {
+			thinking.requiresEffort = true;
+		}
+		if (typeof value.default_level === "string") {
+			const defaultLevel = UMANS_REASONING_EFFORT_BY_LEVEL[value.default_level];
+			if (defaultLevel !== undefined && efforts.includes(defaultLevel)) {
+				thinking.defaultLevel = defaultLevel;
+			}
+		}
+	}
+	return thinking;
+}
+
+function mapUmansModelInfo(
+	modelId: string,
+	raw: UmansModelInfo,
+	baseUrl: string,
+	reference: ModelSpec<"anthropic-messages"> | undefined,
+): ModelSpec<"anthropic-messages"> | null {
+	if (!modelId) return null;
+	const capabilities = isRecord(raw.capabilities) ? raw.capabilities : {};
+	const supportsTools = capabilities.supports_tools;
+	const thinking = mapUmansThinkingConfig(capabilities.reasoning);
+	return {
+		...reference,
+		id: modelId,
+		name: toModelName(raw.display_name, toModelName(raw.name, modelId)),
+		api: "anthropic-messages",
+		provider: "umans",
+		baseUrl,
+		compat: { ...reference?.compat, escapeBuiltinToolNames: true },
+		reasoning: thinking !== undefined,
+		...(thinking ? { thinking } : {}),
+		input: umansSupportsVision(capabilities.supports_vision) ? ["text", "image"] : ["text"],
+		...(supportsTools === false ? { supportsTools: false } : {}),
+		cost: reference?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: toPositiveNumber(capabilities.context_window, reference?.contextWindow ?? null),
+		maxTokens: toPositiveNumber(
+			capabilities.recommended_max_tokens,
+			toPositiveNumber(capabilities.max_completion_tokens, reference?.maxTokens ?? null),
+		),
+	};
+}
+
+async function fetchUmansModelsInfo(options: {
+	baseUrl: string;
+	apiKey?: string;
+	fetch?: FetchImpl;
+	references: Map<string, ModelSpec<"anthropic-messages">>;
+}): Promise<ModelSpec<"anthropic-messages">[] | null> {
+	const discoveryBaseUrl = toAnthropicDiscoveryBaseUrl(options.baseUrl);
+	const requestHeaders: Record<string, string> = { Accept: "application/json" };
+	if (options.apiKey) {
+		requestHeaders["x-api-key"] = options.apiKey;
+	}
+	const fetchImpl = options.fetch ?? fetch;
+	let payload: unknown;
+	try {
+		const response = await fetchImpl(`${discoveryBaseUrl}${UMANS_MODELS_INFO_PATH}`, {
+			method: "GET",
+			headers: requestHeaders,
+		});
+		if (!response.ok) {
+			return null;
+		}
+		payload = await response.json();
+	} catch (error) {
+		throw new Error("Failed to fetch Umans models info", { cause: error });
+	}
+	if (!isRecord(payload)) {
+		return null;
+	}
+	const models: ModelSpec<"anthropic-messages">[] = [];
+	for (const [modelId, value] of Object.entries(payload)) {
+		if (!isRecord(value)) continue;
+		const mapped = mapUmansModelInfo(modelId, value, options.baseUrl, options.references.get(modelId));
+		if (mapped) {
+			models.push(mapped);
+		}
+	}
+	return models.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export function umansModelManagerOptions(config?: UmansModelManagerConfig): ModelManagerOptions<"anthropic-messages"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = normalizeUmansBaseUrl(config?.baseUrl);
+	const references = createBundledReferenceMap<"anthropic-messages">("umans");
+	return {
+		providerId: "umans",
+		dynamicModelsAuthoritative: true,
+		fetchDynamicModels: () => fetchUmansModelsInfo({ baseUrl, apiKey, fetch: config?.fetch, references }),
+	};
+}
+// ---------------------------------------------------------------------------
 // 1. OpenAI
 // ---------------------------------------------------------------------------
 
@@ -694,7 +847,7 @@ interface XAICuratedModel {
 	 * Whether xAI accepts the `reasoning.effort` wire param for this model.
 	 * Default true. When false: picker hides the effort dial (via
 	 * getSupportedEfforts in model-thinking.ts) AND wire-side already omits
-	 * the param via GROK_EFFORT_CAPABLE_PREFIXES in providers/xai-responses.ts.
+	 * the param via GROK_EFFORT_CAPABLE_PREFIXES in pi-ai's stream.ts.
 	 * Must agree with that allowlist; two truths kept in sync by curated-catalog
 	 * author convention until a follow-up Op: compress unifies them.
 	 */
@@ -714,11 +867,9 @@ interface XAICuratedModel {
 // coding-fine-tuned chat model; 512K context per user spec (2026-05-17).
 //
 // supportsReasoningEffort=false entries reason natively but reject the wire
-// `reasoning.effort` param (api.x.ai returns HTTP 400). Mirrors the HTTP-side
-// GROK_EFFORT_CAPABLE_PREFIXES allowlist in providers/xai-responses.ts. The
-// curated flag is the picker-visible truth; the HTTP allowlist is the wire
-// truth. omitReasoningEffort in xai-responses.ts already prevents 400s; this
-// fixes the picker UX wart of advertising an inert dial.
+// `reasoning.effort` param (api.x.ai returns HTTP 400). The corresponding
+// omit/include/history replay defaults live in catalog compat so every
+// OpenAI-family endpoint consumes the same constraint.
 export const XAI_OAUTH_CURATED_MODELS: readonly XAICuratedModel[] = [
 	// grok-build is text-only per the bundled catalog; omit `input` for the default.
 	{ id: "grok-build", contextWindow: 512_000, name: "Grok Build", supportsReasoningEffort: false },
@@ -741,8 +892,7 @@ export const XAI_OAUTH_CURATED_MODELS: readonly XAICuratedModel[] = [
 	},
 	// Cursor's "Composer 2.5 Fast" exposed via SuperGrok: non-reasoning,
 	// text-only, 200K context (mirrors Cursor's composer-* catalog entries).
-	// Off the GROK_EFFORT_CAPABLE_PREFIXES allowlist, so the wire side already
-	// sets omitReasoningEffort=true; reasoning:false also hides the effort dial.
+	// Off the Grok effort-capable allowlist; reasoning:false also hides the effort dial.
 	{
 		id: "grok-composer-2.5-fast",
 		contextWindow: 200_000,
@@ -757,12 +907,31 @@ export const XAI_OAUTH_CURATED_MODELS: readonly XAICuratedModel[] = [
 // strings; the chat picker MUST exclude these prefixes or selecting them 400s.
 const XAI_NON_CHAT_PREFIXES = ["grok-imagine-", "grok-stt-", "grok-voice-"] as const;
 
+const GROK_EFFORT_CAPABLE_PREFIXES = ["grok-3-mini", "grok-4.20-multi-agent", "grok-4.3"] as const;
+
+function grokSupportsReasoningEffort(modelId: string): boolean {
+	const name = modelId.trim().toLowerCase();
+	if (!name) return false;
+	const bare = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+	return GROK_EFFORT_CAPABLE_PREFIXES.some(prefix => bare.startsWith(prefix));
+}
+
+function withXaiOAuthCompatDefaults(model: ModelSpec<"openai-responses">): ModelSpec<"openai-responses"> {
+	const compat = {
+		...(model.compat ?? {}),
+		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: model.compat?.filterReasoningHistory ?? true,
+		omitReasoningEffort: model.compat?.omitReasoningEffort ?? !grokSupportsReasoningEffort(model.id),
+	};
+	return { ...model, compat };
+}
+
 // Hermes-agent parity: only the `minimal -> low` clamp is applied (see
 // hermes-agent/agent/transports/codex.py:92 `_effort_clamp = {"minimal":
 // "low"}`). Hermes sends `xhigh` to xAI verbatim and we match that contract
 // — let xAI decide if the level is valid for the specific Grok model.
 // `resolveModelThinking` folds this into `model.thinking.effortMap`, downstream
-// of the omitReasoningEffort gate in xai-responses.ts.
+// of the omitReasoningEffort gate in pi-ai's stream.ts.
 const XAI_REASONING_EFFORT_MAP = { minimal: "low" } as const;
 
 // xai-oauth's /v1/models exposes no per-request output limit on the OAuth
@@ -789,6 +958,9 @@ function mergeCuratedIntoModel(
 	const compat = {
 		...(base.compat ?? {}),
 		reasoningEffortMap: { ...XAI_REASONING_EFFORT_MAP, ...(base.compat?.reasoningEffortMap ?? {}) },
+		includeEncryptedReasoning: base.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: base.compat?.filterReasoningHistory ?? true,
+		omitReasoningEffort: base.compat?.omitReasoningEffort ?? !grokSupportsReasoningEffort(base.id),
 		...(effort === undefined ? {} : { supportsReasoningEffort: effort }),
 	};
 	return {
@@ -852,7 +1024,7 @@ function applyXAIOAuthCuration(dynamic: readonly ModelSpec<"openai-responses">[]
 	const curatedFirst = XAI_OAUTH_CURATED_MODELS.map(c => byId.get(c.id)).filter(
 		(e): e is ModelSpec<"openai-responses"> => e !== undefined,
 	);
-	const rest = filtered.filter(e => !curatedIds.has(e.id));
+	const rest = filtered.filter(e => !curatedIds.has(e.id)).map(withXaiOAuthCompatDefaults);
 	return [...curatedFirst, ...rest];
 }
 
@@ -1084,6 +1256,23 @@ export function clampFireworksKimiMaxTokens(modelId: string, candidate: number |
 }
 
 /**
+ * Kimi K2.7 Code's documented recommended output budget. Some provider
+ * discovery rows report the context-sized `max_completion_tokens` instead.
+ */
+export const KIMI_K27_CODE_RECOMMENDED_MAX_TOKENS = 32_768;
+
+export function isKimiK27CodeModelId(modelId: string): boolean {
+	return /(?:^|\/)kimi[-._]?k2(?:[._-]?|p)7[-._]?code$/i.test(modelId);
+}
+
+export function clampKimiK27CodeMaxTokens(modelId: string, candidate: number): number;
+export function clampKimiK27CodeMaxTokens(modelId: string, candidate: number | null): number | null;
+export function clampKimiK27CodeMaxTokens(modelId: string, candidate: number | null): number | null {
+	if (candidate === null) return null;
+	return isKimiK27CodeModelId(modelId) ? Math.min(candidate, KIMI_K27_CODE_RECOMMENDED_MAX_TOKENS) : candidate;
+}
+
+/**
  * Fireworks DeepSeek V4 accepts effort via `reasoning_effort` but rejects the
  * DeepSeek-native binary `thinking` toggle when both are present.
  */
@@ -1160,6 +1349,7 @@ function mapFireworksControlPlaneModel(
 ): ModelSpec<"openai-completions"> {
 	const name = toModelName(record.displayName, reference?.name ?? publicModelId);
 	const supportsImage = toBoolean(record.supportsImageInput) === true;
+	const supportsTools = toBoolean(record.supportsTools);
 	const contextWindow = toPositiveNumber(record.contextLength, reference?.contextWindow ?? null);
 	// The control plane reports no max-output budget; default the Kimi family to
 	// its published cap, everyone else to the discovery fallback, then clamp.
@@ -1192,6 +1382,7 @@ function mapFireworksControlPlaneModel(
 		input: supportsImage ? ["text", "image"] : (reference?.input ?? ["text"]),
 		contextWindow,
 		maxTokens,
+		...(supportsTools === false ? { supportsTools: false } : {}),
 	};
 	return stripFireworksDeepSeekThinkingToggle(model, publicModelId);
 }
@@ -1240,7 +1431,6 @@ async function fetchFireworksServerlessModels(options: {
 			if (!isRecord(entry)) continue;
 			const record = entry as FireworksControlPlaneModel;
 			if (toBoolean(record.supportsServerless) !== true) continue;
-			if (toBoolean(record.supportsTools) !== true) continue;
 			if (typeof record.state === "string" && record.state !== "READY") continue;
 			const wireName = typeof record.name === "string" ? record.name : "";
 			if (!wireName) continue;
@@ -1396,6 +1586,7 @@ function mapWaferModel(
 	const capabilities = wafer?.capabilities ?? {};
 	const reasoning = capabilities.reasoning === true;
 	const vision = capabilities.vision === true;
+	const supportsTools = toBoolean(capabilities.tools) === false ? false : undefined;
 	const contextWindow = toPositiveNumber(
 		wafer?.context_length,
 		toPositiveNumber((entry as { max_model_len?: unknown }).max_model_len, defaults.contextWindow),
@@ -1434,6 +1625,7 @@ function mapWaferModel(
 		cost,
 		contextWindow,
 		maxTokens,
+		...(supportsTools === false ? { supportsTools } : {}),
 	};
 	if (reasoning) {
 		// Wafer's `wafer.provider` envelope tells us which upstream backend serves
@@ -2124,6 +2316,7 @@ export function veniceModelManagerOptions(
 					const model = mapWithBundledReference(entry, defaults, reference);
 					return {
 						...model,
+						maxTokens: clampKimiK27CodeMaxTokens(defaults.id, model.maxTokens),
 						compat: { ...model.compat, supportsUsageInStreaming: false },
 					};
 				},
@@ -2304,7 +2497,7 @@ export function xiaomiModelManagerOptions(
 			provider: providerId,
 			baseUrl: url,
 			apiKey,
-			filterModel: (_entry, model) => !model.id.includes("-tts"),
+			filterModel: (_entry, model) => !model.id.includes("-tts") && !model.id.includes("-asr"),
 			mapModel: (entry, defaults) => {
 				const reference = references.get(defaults.id);
 				const model = mapWithBundledReference(entry, defaults, reference);
@@ -2348,9 +2541,10 @@ export function litellmModelManagerOptions(
 	config?: LiteLLMModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "http://localhost:4000/v1";
+	const baseUrl = config?.baseUrl ?? Bun.env.LITELLM_BASE_URL ?? "http://localhost:4000/v1";
 	return {
 		providerId: "litellm",
+		cacheProviderId: `litellm:${Bun.hash(baseUrl).toString(36)}`,
 		// litellm is a local-only proxy whose /v1/models returns bare ids with no
 		// metadata, and it is never bundled in models.json (that would leak the
 		// machine's localhost catalog). It proxies known upstream models, so we
@@ -2633,9 +2827,11 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 	const parsedApiKey = rawApiKey ? parseGitHubCopilotApiKey(rawApiKey) : undefined;
 	const apiKey = parsedApiKey?.accessToken;
 	const baseUrl =
-		parsedApiKey?.enterpriseUrl && configuredBaseUrl.includes("githubcopilot.com")
-			? getGitHubCopilotBaseUrl(parsedApiKey.enterpriseUrl)
-			: configuredBaseUrl;
+		parsedApiKey?.apiEndpoint && configuredBaseUrl.includes("githubcopilot.com")
+			? parsedApiKey.apiEndpoint
+			: parsedApiKey?.enterpriseUrl && configuredBaseUrl.includes("githubcopilot.com")
+				? getGitHubCopilotBaseUrl(parsedApiKey.enterpriseUrl)
+				: configuredBaseUrl;
 	const providerRefs = createBundledReferenceMap<Api>("github-copilot");
 	const resolveReference = createReferenceResolver(providerRefs);
 	return {
@@ -2928,6 +3124,7 @@ export function mapModelsDevToModels(
 				},
 				contextWindow: toPositiveNumber(m.limit?.context, desc.defaultContextWindow ?? null),
 				maxTokens: toPositiveNumber(m.limit?.output, desc.defaultMaxTokens ?? null),
+				...(m.tool_call === false ? { supportsTools: false } : {}),
 				...(desc.compat && { compat: desc.compat }),
 				...(desc.headers && { headers: { ...desc.headers } }),
 			};
@@ -3203,7 +3400,7 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 	// --- Cerebras ---
 	openAiCompletionsDescriptor("cerebras", "cerebras", "https://api.cerebras.ai/v1"),
 	// --- Together ---
-	openAiCompletionsDescriptor("together", "together", "https://api.together.xyz/v1"),
+	openAiCompletionsDescriptor("togetherai", "together", "https://api.together.xyz/v1"),
 	// --- NVIDIA ---
 	openAiCompletionsDescriptor("nvidia", "nvidia", "https://integrate.api.nvidia.com/v1", {
 		defaultContextWindow: 131072,
@@ -3241,6 +3438,8 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDescriptor[] = [
 	// --- zAI ---
 	anthropicMessagesDescriptor("zai-coding-plan", "zai", "https://api.z.ai/api/anthropic"),
+	// --- Umans AI Coding Plan ---
+	anthropicMessagesDescriptor("umans-ai-coding-plan", "umans", UMANS_BASE_URL),
 	// --- Xiaomi ---
 	openAiCompletionsDescriptor("xiaomi", "xiaomi", "https://api.xiaomimimo.com/v1", {
 		defaultContextWindow: 262144,
@@ -3283,7 +3482,7 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 	),
 	// --- Zhipu Coding Plan ---
 	openAiCompletionsDescriptor(
-		"zhipu-coding-plan",
+		"zhipuai-coding-plan",
 		"zhipu-coding-plan",
 		"https://open.bigmodel.cn/api/coding/paas/v4",
 		{
@@ -3310,6 +3509,18 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_GOOGLE_VERTEX: readonly ModelsDevProviderD
 ];
 
 const MODELS_DEV_PROVIDER_DESCRIPTORS_SPECIALIZED: readonly ModelsDevProviderDescriptor[] = [
+	// --- Azure OpenAI ---
+	// OpenAI-family models hosted on Azure, served via the Responses API. baseUrl
+	// is empty: the deployment host is per-resource and resolved at runtime from
+	// AZURE_OPENAI_BASE_URL / AZURE_OPENAI_RESOURCE_NAME (see resolveAzureConfig).
+	simpleModelsDevDescriptor("azure", "azure", "azure-openai-responses", "", {
+		filterModel: (modelId, m) => {
+			if (m.tool_call !== true) return false;
+			// OpenAI-family only (not Foundry/DeepSeek/Claude/Llama/Mistral/Phi, which
+			// Azure serves via non-Responses APIs under a per-model provider override).
+			return /^(gpt-|o1|o3|o4|codex|chatgpt)/.test(modelId);
+		},
+	}),
 	// --- Cloudflare AI Gateway ---
 	anthropicMessagesDescriptor(
 		"cloudflare-ai-gateway",
@@ -3366,6 +3577,41 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_SPECIALIZED: readonly ModelsDevProviderDes
 	// --- MiniMax (Anthropic) ---
 	anthropicMessagesDescriptor("minimax", "minimax", "https://api.minimax.io/anthropic"),
 	anthropicMessagesDescriptor("minimax-cn", "minimax-cn", "https://api.minimaxi.com/anthropic"),
+	// --- Hugging Face ---
+	openAiCompletionsDescriptor("huggingface", "huggingface", "https://router.huggingface.co/v1"),
+	// --- Kilo Gateway ---
+	openAiCompletionsDescriptor("kilo", "kilo", "https://api.kilo.ai/api/gateway"),
+	// --- Moonshot AI ---
+	openAiCompletionsDescriptor("moonshotai", "moonshot", "https://api.moonshot.ai/v1"),
+	// --- NanoGPT ---
+	openAiCompletionsDescriptor("nano-gpt", "nanogpt", "https://nano-gpt.com/api/v1"),
+	// --- Synthetic ---
+	openAiCompletionsDescriptor("synthetic", "synthetic", "https://api.synthetic.new/openai/v1"),
+	// --- Venice AI ---
+	openAiCompletionsDescriptor("venice", "venice", "https://api.venice.ai/api/v1", {
+		transformModel: model => {
+			const maxTokens = clampKimiK27CodeMaxTokens(model.id, model.maxTokens);
+			return maxTokens === model.maxTokens ? model : { ...model, maxTokens };
+		},
+	}),
+	// --- Ollama Cloud ---
+	simpleModelsDevDescriptor("ollama-cloud", "ollama-cloud", "ollama-chat", "https://ollama.com"),
+	// --- Xiaomi Token Plan ---
+	openAiCompletionsDescriptor(
+		"xiaomi-token-plan-ams",
+		"xiaomi-token-plan-ams",
+		"https://token-plan-ams.xiaomimimo.com/v1",
+	),
+	openAiCompletionsDescriptor(
+		"xiaomi-token-plan-cn",
+		"xiaomi-token-plan-cn",
+		"https://token-plan-cn.xiaomimimo.com/v1",
+	),
+	openAiCompletionsDescriptor(
+		"xiaomi-token-plan-sgp",
+		"xiaomi-token-plan-sgp",
+		"https://token-plan-sgp.xiaomimimo.com/v1",
+	),
 	// --- Qwen Portal ---
 	openAiCompletionsDescriptor("qwen-portal", "qwen-portal", "https://portal.qwen.ai/v1", {
 		defaultContextWindow: 128000,

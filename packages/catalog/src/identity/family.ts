@@ -41,6 +41,11 @@ export function isQwenModelId(modelId: string): boolean {
 	return modelId.toLowerCase().includes("qwen");
 }
 
+/** Gemma open-weights family (`gemma-3-27b-it`, `google/gemma-4-E2B-it`, `gemma2-9b`). */
+export function isGemmaModelId(modelId: string): boolean {
+	return /(^|\/)gemma[-.]?\d/i.test(modelId);
+}
+
 /** DeepSeek family by id or display name (proxies often rename the id but keep the name). */
 export function isDeepseekModelIdOrName(value: string): boolean {
 	return value.toLowerCase().includes("deepseek");
@@ -68,6 +73,13 @@ export function isMinimaxM2FamilyModelId(modelId: string): boolean {
 	return /(?:^|[/.-])m2\d*(?:[.-]\d+)?(?:[-.:_]|$)/i.test(lower);
 }
 
+/** MiniMax M3 family ids in bundled/default and aggregator namespace forms. */
+export function isMinimaxM3FamilyModelId(modelId: string): boolean {
+	const lower = modelId.toLowerCase();
+	if (!lower.includes("minimax")) return false;
+	return /(?:^|[/._-])(?:minimax[/._-])?m3(?:[-.:_]|$)/i.test(lower);
+}
+
 /**
  * OpenAI gpt-oss family (`gpt-oss-20b`, `gpt-oss-120b`, `gpt-oss:120b`,
  * `vendor/gpt-oss-…`). The Harmony reasoning format only accepts
@@ -76,6 +88,11 @@ export function isMinimaxM2FamilyModelId(modelId: string): boolean {
  */
 export function isOpenAIGptOssModelId(modelId: string): boolean {
 	return /(^|\/)gpt-oss[-:]/i.test(modelId);
+}
+
+/** OpenAI model ids (gpt-*, o1-*, o3-*, o4-*, or prefixed with openai/). */
+export function isOpenAIModelId(modelId: string): boolean {
+	return /(^|\/)(gpt|o1|o3|o4)[-.]/i.test(modelId) || modelId.toLowerCase().includes("openai/");
 }
 
 /**
@@ -94,6 +111,17 @@ export function isReasoningGlmModelId(modelId: string): boolean {
 		return false;
 	}
 	return semverGte(glm.version, "4.5");
+}
+/** GLM-5.2+ coding SKUs accept `reasoning_effort` in addition to binary thinking. */
+export function isGlm52ReasoningEffortModelId(modelId: string): boolean {
+	const glm = parseGlmModel(bareModelId(modelId));
+	if (!glm || glm.vision) {
+		return false;
+	}
+	if (glm.variant !== "base" && glm.variant !== "air" && glm.variant !== "turbo") {
+		return false;
+	}
+	return semverGte(glm.version, "5.2");
 }
 
 /** GLM vision SKUs — the `v` that attaches to the version (`glm-4v`, `glm-4.5v`). */
@@ -114,12 +142,15 @@ export function isGlmVisionModelId(modelId: string): boolean {
 export function modelFamilyToken(modelId: string): string {
 	const parsed = parseKnownModel(modelId);
 	if (parsed.family !== "unknown") return parsed.family;
+	if (isClaudeModelId(modelId) || isAnthropicNamespacedModelId(modelId)) return "anthropic";
+	if (isOpenAIModelId(modelId)) return "openai";
 	if (isKimiModelId(modelId)) return "kimi";
 	if (isQwenModelId(modelId)) return "qwen";
-	if (isMinimaxM2FamilyModelId(modelId)) return "minimax";
+	if (isMinimaxM2FamilyModelId(modelId) || isMinimaxM3FamilyModelId(modelId)) return "minimax";
 	if (isOpenAIGptOssModelId(modelId)) return "gpt-oss";
 	if (isDeepseekModelIdOrName(modelId)) return "deepseek";
 	if (isMimoModelIdOrName(modelId)) return "mimo";
+	if (isGemmaModelId(modelId)) return "gemma";
 	if (parseGlmModel(bareModelId(modelId))) return "glm";
 	return "";
 }

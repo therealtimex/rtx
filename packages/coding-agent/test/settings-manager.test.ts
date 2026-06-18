@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-ai";
 import {
 	getDefault,
+	getEnumValues,
 	onAppendOnlyModeChanged,
 	onStatusLineSessionAccentChanged,
 	resetSettingsForTest,
@@ -63,6 +64,32 @@ describe("Settings", () => {
 		it("keeps eight inline images live by default", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("tui.maxInlineImages")).toBe(8);
+		});
+
+		it("keeps the normal startup splash disabled by default", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("startup.showSplash")).toBe(false);
+			expect(getDefault("startup.showSplash")).toBe(false);
+		});
+
+		it("exposes all tool calling mode options", () => {
+			const values = getEnumValues("tools.format");
+			expect(values).toEqual([
+				"auto",
+				"native",
+				"glm",
+				"hermes",
+				"kimi",
+				"xml",
+				"anthropic",
+				"deepseek",
+				"harmony",
+				"pi",
+				"qwen3",
+				"gemini",
+				"gemma",
+				"minimax",
+			]);
 		});
 	});
 

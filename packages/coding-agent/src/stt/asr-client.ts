@@ -72,7 +72,7 @@ const SMOKE_TEST_TIMEOUT_MS = 30_000;
  * Hidden subcommand on the main CLI that boots the speech-recognition worker in
  * the spawned subprocess. Kept in sync with the dispatch in `cli.ts`.
  */
-export const STT_WORKER_ARG = "__omp_stt_worker";
+export const STT_WORKER_ARG = "__omp_worker_stt";
 
 function readTinyModelSetting(key: "providers.tinyModelDevice" | "providers.tinyModelDtype"): string | undefined {
 	try {
@@ -314,6 +314,12 @@ export class SttClient {
 		const worker = this.#ensureWorker();
 		const id = String(++this.#nextRequestId);
 		const { promise, resolve, reject } = Promise.withResolvers<string>();
+		// `stop()` is normally the only awaiter of `promise`, but with model loading
+		// now deferred to the stream, a load failure (or early worker error) can
+		// reject it before the caller stops — attach a benign handler so that never
+		// surfaces as an unhandled rejection. stop()/await still observes the
+		// rejection through the original promise.
+		void promise.catch(() => {});
 		const signal = options.signal;
 		let settled = false;
 		const onAbort = (): void => handle.cancel();

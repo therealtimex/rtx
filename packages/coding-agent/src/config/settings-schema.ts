@@ -34,7 +34,7 @@ import {
 	TTS_LOCAL_VOICE_VALUES,
 } from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES } from "../web/search/types";
+import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES, type SearchProviderId } from "../web/search/types";
 
 /** Unified settings schema - single source of truth for all settings.
  *
@@ -106,7 +106,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
  */
 export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	appearance: ["Theme", "Status Line", "Display", "Images"],
-	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback"],
+	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Vision"],
 	interaction: [
 		"Input",
 		"Approvals",
@@ -116,6 +116,8 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Magic Keywords",
 		"Startup & Updates",
 		"Power (macOS)",
+		"Agent",
+		"Git",
 	],
 	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
 	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
@@ -380,7 +382,69 @@ export const SETTINGS_SCHEMA = {
 			description: "Keep the display from idle-sleeping while a session is open (caffeinate -d)",
 		},
 	},
+	"advisor.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Enable Advisor",
+			description:
+				"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and injects notes.",
+		},
+	},
+	"advisor.subagents": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor for Subagents",
+			description: "Also enable the advisor on spawned task/eval subagents.",
+		},
+	},
+	"advisor.syncBacklog": {
+		type: "enum",
+		values: ["off", "1", "3", "5"] as const,
+		default: "off",
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor Sync Backlog",
+			description:
+				"Pause the main agent for up to 30 seconds if the advisor falls behind by this many turns. Off disables catch-up delays.",
+		},
+	},
+	"advisor.immuneTurns": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Advisor Immune Turns",
+			description:
+				"After an advisor concern or blocker interrupts, route further concerns/blockers non-interruptingly for this many primary turns.",
+			options: [
+				{ value: "0", label: "0 turns", description: "Allow every concern/blocker to interrupt." },
+				{ value: "1", label: "1 turn", description: "Default." },
+				{ value: "2", label: "2 turns" },
+				{ value: "3", label: "3 turns" },
+				{ value: "4", label: "4 turns" },
+				{ value: "5", label: "5 turns" },
+			],
+		},
+	},
 	shellPath: { type: "string", default: undefined },
+	"git.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Git",
+			label: "Enable Git Integration",
+			description: "Show git branch, status, and PR information in the TUI and watch repository metadata.",
+		},
+	},
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
@@ -678,6 +742,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"images.describeForTextModels": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Vision",
+			label: "Describe Images for Text Models",
+			description:
+				"When an image is attached to a model without vision support, save it under local:// and inject a description from a vision-capable model instead of dropping it",
+		},
+	},
+
 	"tui.maxInlineImageColumns": {
 		type: "number",
 		default: 100,
@@ -721,6 +797,16 @@ export const SETTINGS_SCHEMA = {
 			label: "Terminal Hyperlinks",
 			description:
 				"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+		},
+	},
+	"tui.tight": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Tight Layout",
+			description: "Remove the 1-character horizontal padding from the left and right of the terminal output",
 		},
 	},
 	// Display rendering
@@ -1250,6 +1336,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"startup.showSplash": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Startup & Updates",
+			label: "Show Startup Splash",
+			description:
+				"Show the full animated setup splash on normal interactive startup without rerunning setup. Quiet Startup still suppresses it.",
+		},
+	},
+
 	"startup.setupWizard": {
 		type: "boolean",
 		default: true,
@@ -1471,7 +1569,7 @@ export const SETTINGS_SCHEMA = {
 	// Context promotion
 	"contextPromotion.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "context",
 			group: "General",
@@ -1716,6 +1814,54 @@ export const SETTINGS_SCHEMA = {
 			label: "Snapcompact Tool Results",
 			description:
 				"Experimental: render large historical tool results as dense PNG image(s) instead of text (vision models only). Saves tokens on accumulated read/search output.",
+		},
+	},
+
+	"tools.format": {
+		type: "enum",
+		values: [
+			"auto",
+			"native",
+			"glm",
+			"hermes",
+			"kimi",
+			"xml",
+			"anthropic",
+			"deepseek",
+			"harmony",
+			"pi",
+			"qwen3",
+			"gemini",
+			"gemma",
+			"minimax",
+		] as const,
+		default: "auto",
+		ui: {
+			tab: "context",
+			group: "Experimental",
+			label: "Tool Calling Mode",
+			description:
+				"Controls how tools are exposed to the model. Auto uses provider-native tool calls unless the selected model is marked as not supporting them, then falls back to the GLM owned dialect. Native forces provider-native tools; the other values force the named owned dialect. Applies on session start.",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Use native tool calls unless the model is known not to support them.",
+				},
+				{ value: "native", label: "Native", description: "Use provider-native tool calls." },
+				{ value: "glm", label: "GLM", description: "Use GLM-style in-band tool calls." },
+				{ value: "hermes", label: "Hermes", description: "Use Hermes-style in-band tool calls." },
+				{ value: "kimi", label: "Kimi", description: "Use Kimi-style in-band tool calls." },
+				{ value: "xml", label: "XML", description: "Use generic XML in-band tool calls." },
+				{ value: "anthropic", label: "Anthropic", description: "Use Anthropic-style in-band tool calls." },
+				{ value: "deepseek", label: "DeepSeek", description: "Use DeepSeek-style in-band tool calls." },
+				{ value: "harmony", label: "Harmony", description: "Use Harmony-style in-band tool calls." },
+				{ value: "pi", label: "Pi", description: "Use the Pi owned dialect." },
+				{ value: "qwen3", label: "Qwen3", description: "Use the Qwen3 owned dialect." },
+				{ value: "gemini", label: "Gemini", description: "Use the Gemini owned dialect." },
+				{ value: "gemma", label: "Gemma", description: "Use the Gemma owned dialect." },
+				{ value: "minimax", label: "MiniMax", description: "Use the MiniMax owned dialect." },
+			],
 		},
 	},
 
@@ -2578,7 +2724,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Read Summaries",
 			label: "Read Summary Unfold Ceiling",
 			description:
-				"Hard ceiling on summary size while BFS-unfolding. An unfold that would exceed this is reverted and unfolding stops.",
+				"Hard ceiling on summary size while BFS-unfolding. An unfold whose revealed lines would exceed this is skipped (that span stays folded) and unfolding continues with the remaining spans.",
 		},
 	},
 
@@ -2990,17 +3136,6 @@ export const SETTINGS_SCHEMA = {
 
 	// Optional tools
 
-	"renderMermaid.enabled": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "tools",
-			group: "Available Tools",
-			label: "Render Mermaid",
-			description: "Enable the render_mermaid tool for Mermaid-to-ASCII rendering",
-		},
-	},
-
 	"debug.enabled": {
 		type: "boolean",
 		default: true,
@@ -3183,6 +3318,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Ask the agent to describe the intent of each tool call before executing it",
 		},
 	},
+	"tools.abortOnFabricatedResult": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Execution",
+			label: "Abort On Fabricated Tool Result",
+			description:
+				"With in-band tool calls, stop the model immediately when it starts hallucinating a tool result mid-turn. Disable to let the model finish generating and discard the fabricated continuation instead.",
+		},
+	},
 
 	"tools.maxTimeout": {
 		type: "number",
@@ -3360,6 +3506,18 @@ export const SETTINGS_SCHEMA = {
 			group: "Modes",
 			label: "Plan Mode",
 			description: "Enable plan mode for read-only exploration and planning before execution",
+		},
+	},
+
+	"plan.defaultOnStartup": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Start in Plan Mode",
+			description: "Automatically enter plan mode at the start of every new session",
+			condition: "planModeEnabled",
 		},
 	},
 
@@ -3755,6 +3913,44 @@ export const SETTINGS_SCHEMA = {
 			options: SEARCH_PROVIDER_OPTIONS,
 		},
 	},
+	"providers.webSearchExclude": {
+		type: "array",
+		default: [] as SearchProviderId[],
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Excluded Web Search Providers",
+			description: "Providers that web_search should never use, even as fallbacks",
+		},
+	},
+	"providers.antigravityEndpoint": {
+		type: "enum",
+		values: ["auto", "production", "sandbox"] as const,
+		default: "auto",
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Antigravity Endpoint Mode",
+			description: "Endpoint routing strategy for google-antigravity providers (chat, search, image, discovery)",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Try production endpoint, fail over to sandbox on 5xx/429",
+				},
+				{
+					value: "production",
+					label: "Production Only",
+					description: "Force production endpoint only",
+				},
+				{
+					value: "sandbox",
+					label: "Sandbox Only",
+					description: "Force sandbox endpoint only",
+				},
+			],
+		},
+	},
 	"providers.image": {
 		type: "enum",
 		values: ["auto", "openai", "antigravity", "xai", "gemini", "openrouter"] as const,
@@ -3938,6 +4134,30 @@ export const SETTINGS_SCHEMA = {
 				"Difficulty classifier for the `auto` thinking level: online smol by default, or a local on-device model",
 			condition: "autoThinkingActive",
 			options: AUTO_THINKING_MODEL_OPTIONS,
+		},
+	},
+	"features.unexpectedStopDetection": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Agent",
+			label: "Detect unexpected stops",
+			description:
+				"Use a small model to detect when the assistant says it will continue but stops without tool calls; automatically prompt it to continue.",
+		},
+	},
+	"providers.unexpectedStopModel": {
+		type: "enum",
+		values: TINY_MEMORY_MODEL_VALUES,
+		default: ONLINE_MEMORY_MODEL_KEY,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "Unexpected Stop Model",
+			description: "Classifier for unexpected-stop detection: online smol by default, or a local on-device model.",
+			condition: "unexpectedStopDetection",
+			options: TINY_MEMORY_MODEL_OPTIONS,
 		},
 	},
 

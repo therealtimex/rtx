@@ -1,9 +1,10 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import chalk from "chalk";
-import { z } from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
@@ -43,30 +44,27 @@ export interface TodoToolDetails {
 // Schema
 // =============================================================================
 
-const TodoOp = z
-	.enum(["init", "start", "done", "rm", "drop", "append", "view"] as const)
-	.describe("operation to apply");
+const TodoOp = type('"init" | "start" | "done" | "rm" | "drop" | "append" | "view"').describe("operation to apply");
 
-const InitListEntry = z.object({
-	phase: z.string().describe("phase name"),
-	items: z.array(z.string().describe("task content")).min(1).describe("tasks for this phase"),
+const InitListEntry = type({
+	phase: type("string").describe("phase name"),
+	items: type("string").describe("task content").array().atLeastLength(1).describe("tasks for this phase"),
 });
 
-const TodoOpEntry = z.object({
+const TodoOpEntry = type({
 	op: TodoOp,
-	list: z.array(InitListEntry).optional().describe("phased task list (init)"),
-	task: z.string().optional().describe("task content"),
-	phase: z.string().optional().describe("phase name"),
-	items: z.array(z.string().describe("task content")).min(1).optional().describe("tasks to append"),
+	"list?": InitListEntry.array().describe("phased task list (init)"),
+	"task?": type("string").describe("task content"),
+	"phase?": type("string").describe("phase name"),
+	"items?": type("string").describe("task content").array().atLeastLength(1).describe("tasks to append"),
 });
 
-const todoSchema = z
-	.object({
-		ops: z.array(TodoOpEntry).min(1).describe("ordered todo operations"),
-	})
-	.describe("apply ordered todo operations");
+const todoSchema = type({
+	ops: TodoOpEntry.array().atLeastLength(1).describe("ordered todo operations"),
+}).describe("apply ordered todo operations");
 
-type TodoParams = z.infer<typeof todoSchema>;
+type TodoParams = TodoSchema;
+type TodoSchema = typeof todoSchema.infer;
 type TodoOpEntryValue = TodoParams["ops"][number];
 
 // =============================================================================
@@ -270,8 +268,20 @@ function getTaskTargets(phases: TodoPhase[], entry: TodoOpEntryValue, errors: st
 	return phases.flatMap(phase => phase.tasks);
 }
 
+/** Phase name for `init` given a flat `items` list with no explicit `phase`. */
+const DEFAULT_INIT_PHASE = "Tasks";
+
 function initPhases(entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
-	if (!entry.list) {
+	// Models routinely flatten the single-phase init into `{op:"init", items:[...]}`
+	// (optionally with a bare `phase`) instead of the canonical
+	// `list: [{phase, items}]`. Accept that shape by synthesizing a one-phase list
+	// so a common, recoverable mistake isn't a hard error.
+	const list =
+		entry.list ??
+		(entry.items && entry.items.length > 0
+			? [{ phase: entry.phase ?? DEFAULT_INIT_PHASE, items: entry.items }]
+			: undefined);
+	if (!list) {
 		errors.push("Missing list for init operation");
 		return [];
 	}
@@ -279,7 +289,7 @@ function initPhases(entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
 	// (every targeting op resolves the first match), so reject them up front.
 	const seenPhases = new Set<string>();
 	const seenTasks = new Set<string>();
-	for (const listEntry of entry.list) {
+	for (const listEntry of list) {
 		if (seenPhases.has(listEntry.phase)) {
 			errors.push(`Duplicate phase "${listEntry.phase}" in init list`);
 		}
@@ -291,7 +301,7 @@ function initPhases(entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
 			seenTasks.add(content);
 		}
 	}
-	return entry.list.map(listEntry => ({
+	return list.map(listEntry => ({
 		name: listEntry.phase,
 		tasks: listEntry.items.map<TodoItem>(content => ({ content, status: "pending" })),
 	}));
@@ -551,6 +561,71 @@ export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 	readonly parameters = todoSchema;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
+
+	readonly examples: readonly ToolExample<typeof todoSchema.infer>[] = [
+		{
+			caption: "Initial setup (multi-phase)",
+			call: {
+				ops: [
+					{
+						op: "init",
+						list: [
+							{ phase: "Foundation", items: ["Scaffold crate", "Wire workspace"] },
+							{ phase: "Auth", items: ["Port credential store", "Wire OAuth providers"] },
+							{ phase: "Verification", items: ["Run cargo test"] },
+						],
+					},
+				],
+			},
+		},
+		{
+			caption: "View current state (read-only)",
+			call: {
+				ops: [{ op: "view" }],
+			},
+		},
+		{
+			caption: "Initial setup (single phase)",
+			call: {
+				ops: [
+					{
+						op: "init",
+						list: [{ phase: "Implementation", items: ["Apply fix", "Run tests"] }],
+					},
+				],
+			},
+		},
+		{
+			caption: "Complete one task",
+			call: {
+				ops: [{ op: "done", task: "Wire workspace" }],
+			},
+		},
+		{
+			caption: "Complete a whole phase",
+			call: {
+				ops: [{ op: "done", phase: "Auth" }],
+			},
+		},
+		{
+			caption: "Remove all tasks",
+			call: {
+				ops: [{ op: "rm" }],
+			},
+		},
+		{
+			caption: "Drop one task",
+			call: {
+				ops: [{ op: "drop", task: "Run cargo test" }],
+			},
+		},
+		{
+			caption: "Append tasks to a phase",
+			call: {
+				ops: [{ op: "append", phase: "Auth", items: ["Handle retries", "Run tests"] }],
+			},
+		},
+	];
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(todoDescription);
@@ -839,6 +914,7 @@ export const todoToolRenderer = {
 						expanded,
 						maxCollapsed: PREVIEW_LIMITS.COLLAPSED_ITEMS,
 						itemType: "todo",
+						truncateFrom: "start",
 						renderItem: todo => formatTodoLine(todo, uiTheme, "", completionKeys, spinnerFrame),
 					},
 					uiTheme,

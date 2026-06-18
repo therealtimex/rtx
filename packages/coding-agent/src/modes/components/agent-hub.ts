@@ -17,8 +17,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import { Container, Editor, matchesKey, ScrollView, Text, type TUI } from "@oh-my-pi/pi-tui";
+import { Container, Editor, Ellipsis, matchesKey, ScrollView, Text, type TUI } from "@oh-my-pi/pi-tui";
 import { formatAge, formatBytes, formatDuration, formatNumber, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import type { KeyId } from "../../config/keybindings";
 import { settings } from "../../config/settings";
@@ -41,10 +42,11 @@ import type { SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { createIrcMessageCard } from "../../tools/irc";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
-import { hasVisibleThinking } from "../../utils/thinking-display";
+import { canonicalizeMessage } from "../../utils/thinking-display";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { getEditorTheme, theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
+import { createAdvisorMessageCard } from "./advisor-message";
 import { AssistantMessageComponent } from "./assistant-message";
 import { createBackgroundTanDispatchBlock } from "./background-tan-message";
 import { BashExecutionComponent } from "./bash-execution";
@@ -79,7 +81,12 @@ function contentWidth(): number {
 
 /** Sanitize a line for TUI display: replace tabs, then truncate to viewport width. */
 function sanitizeLine(text: string, maxWidth?: number): string {
-	return truncateToWidth(replaceTabs(text), maxWidth ?? contentWidth());
+	const singleLine = replaceTabs(text).replace(/[\r\n]+/g, " ");
+	return truncateToWidth(singleLine, maxWidth ?? contentWidth());
+}
+
+function clampHubLine(line: string, width: number): string {
+	return truncateToWidth(line.replace(/[\r\n]+/g, " "), Math.max(1, width - 2), Ellipsis.Omit);
 }
 
 const STATUS_ORDER: Record<AgentStatus, number> = { running: 0, idle: 1, parked: 2, aborted: 3 };
@@ -193,6 +200,8 @@ export class AgentHubOverlayComponent extends Container {
 	#rows: AgentRef[] = [];
 	#selectedRow = 0;
 	#notice: string | undefined;
+	/** Captured row order from the first refresh; keeps the hub stable while open. */
+	#rowOrder: Map<string, number> | undefined;
 
 	// Chat state
 	#chatAgentId: string | undefined;
@@ -294,7 +303,8 @@ export class AgentHubOverlayComponent extends Container {
 	}
 
 	override render(width: number): readonly string[] {
-		return this.#view === "table" ? this.#renderTable(width) : this.#renderChat(width);
+		const lines = this.#view === "table" ? this.#renderTable(width) : this.#renderChat(width);
+		return lines.map(line => clampHubLine(line, width));
 	}
 
 	handleInput(keyData: string): void {
@@ -349,10 +359,32 @@ export class AgentHubOverlayComponent extends Container {
 
 	#refreshRows(): void {
 		const selectedId = this.#rows[this.#selectedRow]?.id;
-		this.#rows = this.#registry
-			.list()
-			.filter(ref => ref.id !== MAIN_AGENT_ID)
-			.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity);
+		const refs = this.#registry.list().filter(ref => ref.id !== MAIN_AGENT_ID);
+
+		if (!this.#rowOrder) {
+			// First refresh (usually the constructor): order by status, then recency.
+			this.#rows = refs.sort(
+				(a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.lastActivity - a.lastActivity,
+			);
+			this.#rowOrder = new Map(this.#rows.map((ref, i) => [ref.id, i]));
+		} else {
+			// After the hub is open, freeze the relative order so keyboard selection
+			// does not jump around as agents heartbeat or update activity. New agents
+			// are appended at the end and then stay put.
+			this.#rows = refs.sort((a, b) => {
+				const statusDiff = STATUS_ORDER[a.status] - STATUS_ORDER[b.status];
+				if (statusDiff !== 0) return statusDiff;
+				const aOrder = this.#rowOrder!.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+				const bOrder = this.#rowOrder!.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+				return aOrder - bOrder;
+			});
+			for (const ref of this.#rows) {
+				if (!this.#rowOrder.has(ref.id)) {
+					this.#rowOrder.set(ref.id, this.#rowOrder.size);
+				}
+			}
+		}
+
 		const keptIndex = selectedId ? this.#rows.findIndex(ref => ref.id === selectedId) : -1;
 		this.#selectedRow = keptIndex >= 0 ? keptIndex : Math.min(this.#selectedRow, Math.max(0, this.#rows.length - 1));
 	}
@@ -464,7 +496,8 @@ export class AgentHubOverlayComponent extends Container {
 			parts.push(theme.fg("warning", `⧉ ${unread}`));
 		}
 		parts.push(theme.fg("dim", formatAge(Math.max(1, Math.round((Date.now() - ref.lastActivity) / 1000)))));
-		return truncateToWidth(` ${cursor} ${parts.join(theme.sep.dot)}`, Math.max(10, width - 1));
+		const rawLine = ` ${cursor} ${parts.join(theme.sep.dot)}`;
+		return truncateToWidth(rawLine.replace(/[\r\n]+/g, " "), Math.max(1, width - 1));
 	}
 
 	#handleTableInput(keyData: string): void {
@@ -1028,8 +1061,8 @@ export class AgentHubOverlayComponent extends Container {
 
 		const hasVisibleAssistantContent = message.content.some(
 			content =>
-				(content.type === "text" && content.text.trim().length > 0) ||
-				(content.type === "thinking" && hasVisibleThinking(content)),
+				(content.type === "text" && canonicalizeMessage(content.text)) ||
+				(content.type === "thinking" && canonicalizeMessage(content.thinking)),
 		);
 		if (hasVisibleAssistantContent) {
 			// New visible turn content closes the current read run (mirrors rebuild).
@@ -1215,6 +1248,11 @@ export class AgentHubOverlayComponent extends Container {
 				theme,
 			);
 			this.#chatLog.addChild(card);
+			return;
+		}
+		if (message.customType === "advisor") {
+			const details = (message as CustomMessage<AdvisorMessageDetails>).details;
+			this.#chatLog.addChild(createAdvisorMessageCard(details, () => this.#chatExpanded, theme));
 			return;
 		}
 		if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {

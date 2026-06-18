@@ -28,11 +28,13 @@ export interface Args {
 	smol?: string;
 	slow?: string;
 	plan?: string;
+	maxTime?: number;
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	thinking?: Effort;
 	hideThinking?: boolean;
+	advisor?: boolean;
 	continue?: boolean;
 	resume?: string | true;
 	help?: boolean;
@@ -194,6 +196,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noPty = true;
 		} else if (arg === "--hide-thinking") {
 			result.hideThinking = true;
+		} else if (arg === "--advisor") {
+			result.advisor = true;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--no-extensions") {
@@ -279,6 +283,8 @@ export function getExtraHelpText(): string {
   KILO_API_KEY               - Kilo Gateway models
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  UMANS_AI_CODING_PLAN_API_KEY - Umans AI Coding Plan models
+  UMANS_WEBSEARCH_PROVIDER    - Umans gateway web search backend (native or exa)
   MINIMAX_API_KEY            - MiniMax models
   OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
   CURSOR_ACCESS_TOKEN        - Cursor AI models

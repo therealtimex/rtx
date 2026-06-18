@@ -26,7 +26,7 @@ import { buildSkillPromptMessage } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
-import { SKILL_PROMPT_MESSAGE_TYPE } from "../../session/messages";
+import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import type { EventBus } from "../../utils/event-bus";
@@ -751,12 +751,12 @@ export async function runRpcMode(
 			}
 
 			case "abort": {
-				await session.abort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
 
 			case "abort_and_prompt": {
-				await session.abort();
+				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				session
 					.prompt(command.message, { images: command.images })
 					.catch(e => output(error(id, "abort_and_prompt", e.message)));
@@ -796,6 +796,7 @@ export async function runRpcMode(
 						name: tool.name,
 						description: tool.description,
 						parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
+						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
 				};

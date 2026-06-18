@@ -704,6 +704,8 @@ export function resolveAnthropicMetadataUserId(
 	return generateClaudeJsonUserId(sessionId, accountId);
 }
 const ANTHROPIC_BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "text_editor", "computer"]);
+const UMANS_WEBSEARCH_PROVIDER_HEADER = "X-Umans-Websearch-Provider";
+const UMANS_WEBSEARCH_TOOL_NAME = "web_search";
 export const applyClaudeToolPrefix = (name: string): string => {
 	if (!claudeToolPrefix) return name;
 	if (ANTHROPIC_BUILTIN_TOOL_NAMES.has(name.toLowerCase())) return name;
@@ -720,6 +722,50 @@ export const stripClaudeToolPrefix = (name: string): string => {
 	if (!name.toLowerCase().startsWith(claudeToolPrefix.toLowerCase())) return name;
 	return name.slice(claudeToolPrefix.length);
 };
+
+function normalizeUmansWebSearchProvider(value: string | undefined): "native" | "exa" | undefined {
+	const normalized = value?.trim().toLowerCase();
+	return normalized === "native" || normalized === "exa" ? normalized : undefined;
+}
+
+function getUmansWebSearchProvider(headers: Record<string, string> | undefined): "native" | "exa" | undefined {
+	const explicit = getHeaderCaseInsensitive(headers, UMANS_WEBSEARCH_PROVIDER_HEADER);
+	if (explicit !== undefined) return normalizeUmansWebSearchProvider(explicit);
+	return normalizeUmansWebSearchProvider($env.UMANS_WEBSEARCH_PROVIDER);
+}
+
+function isUmansAnthropicModel(model: Model<"anthropic-messages">): boolean {
+	return model.provider === "umans" || model.baseUrl.toLowerCase().includes("api.code.umans.ai");
+}
+
+function getUmansWebSearchHeader(
+	model: Model<"anthropic-messages">,
+	headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (!isUmansAnthropicModel(model)) return undefined;
+	const provider = getUmansWebSearchProvider(headers);
+	return provider ? { [UMANS_WEBSEARCH_PROVIDER_HEADER]: provider } : undefined;
+}
+
+function shouldUseUmansGatewayWebSearch(name: string, enabled: boolean): boolean {
+	return enabled && name.toLowerCase() === UMANS_WEBSEARCH_TOOL_NAME;
+}
+
+function encodeAnthropicToolName(
+	name: string,
+	isOAuthToken: boolean,
+	escapeBuiltinToolNames: boolean,
+	useUmansGatewayWebSearch = false,
+): string {
+	if (shouldUseUmansGatewayWebSearch(name, useUmansGatewayWebSearch)) return name;
+	if (escapeBuiltinToolNames) return `${claudeToolPrefix}${name}`;
+	return isOAuthToken ? applyClaudeToolPrefix(name) : name;
+}
+
+function decodeAnthropicToolName(name: string, isOAuthToken: boolean, escapeBuiltinToolNames: boolean): string {
+	if (isOAuthToken || escapeBuiltinToolNames) return stripClaudeToolPrefix(name);
+	return name;
+}
 
 const ANTHROPIC_MANY_IMAGE_THRESHOLD = 20;
 const ANTHROPIC_MANY_IMAGE_MAX_DIMENSION = 2000;
@@ -1462,6 +1508,19 @@ export function isProviderRetryableError(error: unknown, provider?: string): boo
 	return isRetryableError(error);
 }
 
+const THINKING_ENVELOPE_OPEN = "<thinking>";
+const THINKING_ENVELOPE_CLOSE = "</thinking>";
+
+function unwrapAnthropicThinkingEnvelope(text: string): string | undefined {
+	let current = text.trim();
+	let stripped = false;
+	while (current.startsWith(THINKING_ENVELOPE_OPEN) && current.endsWith(THINKING_ENVELOPE_CLOSE)) {
+		current = current.slice(THINKING_ENVELOPE_OPEN.length, current.length - THINKING_ENVELOPE_CLOSE.length).trim();
+		stripped = true;
+	}
+	return stripped ? current : undefined;
+}
+
 function createEmptyUsage(premiumRequests?: number): Usage {
 	return {
 		input: 0,
@@ -1567,6 +1626,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let disableStrictTools =
 				(providerSessionState?.strictToolsDisabled ?? false) || (model.compat?.disableStrictTools ?? false);
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
+			const mergedCallerHeaders = mergeHeaders(model.headers, options?.headers);
+			const umansGatewayWebSearchHeader = getUmansWebSearchHeader(model, mergedCallerHeaders);
 
 			let client: AnthropicMessagesClientLike;
 			let isOAuthToken: boolean;
@@ -1628,7 +1689,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			}
 			const preparedContext = await prepareAnthropicManyImageContext(context, model.input.includes("image"));
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
-				let nextParams = buildParams(model, preparedContext, isOAuthToken, options, disableStrictTools);
+				let nextParams = buildParams(
+					model,
+					preparedContext,
+					isOAuthToken,
+					options,
+					disableStrictTools,
+					umansGatewayWebSearchHeader !== undefined,
+				);
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
 				}
@@ -1668,6 +1736,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (block.type === "text") {
 					stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
 				} else if (block.type === "thinking") {
+					const unwrappedThinking = unwrapAnthropicThinkingEnvelope(block.thinking);
+					if (unwrappedThinking !== undefined) {
+						block.thinking = unwrappedThinking;
+						block.thinkingSignature = undefined;
+					}
 					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 				} else if (block.type === "toolCall") {
 					const finalJson =
@@ -1701,7 +1774,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				// to zero even when no watchdog timeout is configured (the helper only
 				// pins it alongside a timeout; a client retry budget of 5 would otherwise
 				// multiply with PROVIDER_MAX_RETRIES into up to 66 wire attempts).
-				const requestOptions = { ...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs), maxRetries: 0 };
+				const requestOptions = {
+					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
+					maxRetries: 0,
+					...(umansGatewayWebSearchHeader ? { headers: umansGatewayWebSearchHeader } : {}),
+				};
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...params, stream: true }, requestOptions)
@@ -1884,9 +1961,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const block: Block = {
 									type: "toolCall",
 									id: event.content_block.id,
-									name: isOAuthToken
-										? stripClaudeToolPrefix(event.content_block.name)
-										: event.content_block.name,
+									name: decodeAnthropicToolName(
+										event.content_block.name,
+										isOAuthToken,
+										model.compat.escapeBuiltinToolNames,
+									),
 									arguments: event.content_block.input ?? {},
 									partialJson: "",
 									index: event.index,
@@ -2361,7 +2440,13 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isOAuth: oauthToken,
 		extraBetas: betaFeatures,
 		stream,
-		modelHeaders: mergeHeaders(model.headers, foundryCustomHeaders, headers, dynamicHeaders),
+		modelHeaders: mergeHeaders(
+			model.headers,
+			foundryCustomHeaders,
+			getUmansWebSearchHeader(model, mergeHeaders(model.headers, headers)),
+			headers,
+			dynamicHeaders,
+		),
 		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
 		claudeCodeSessionId,
 		claudeCodeBetas: oauthToken
@@ -2382,10 +2467,9 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
-	// OpenCode Go's Anthropic-compatible gateway validates API-key auth through
-	// `X-Api-Key`; bearer-only requests reach the endpoint but return
-	// `Missing API key` before token validation.
-	if (model.provider === "opencode-go") {
+	// OpenCode Go and Umans validate Anthropic-compatible API-key auth through
+	// `X-Api-Key`; bearer-only requests reach the endpoint but fail auth.
+	if (model.provider === "opencode-go" || model.provider === "umans") {
 		delete defaultHeaders.Authorization;
 		return {
 			isOAuthToken: false,
@@ -2729,6 +2813,7 @@ function buildParams(
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
 	disableStrictTools = false,
+	useUmansGatewayWebSearch = false,
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, isOAuthToken);
 
@@ -2750,6 +2835,8 @@ function buildParams(
 			isOAuthToken,
 			disableStrictTools || model.provider === "github-copilot",
 			model.compat.supportsEagerToolInputStreaming,
+			model.compat.escapeBuiltinToolNames,
+			useUmansGatewayWebSearch,
 		);
 	} else if (isOAuthToken) {
 		tools = [];
@@ -2875,10 +2962,16 @@ function buildParams(
 	if (options?.toolChoice) {
 		if (typeof options.toolChoice === "string") {
 			params.tool_choice = { type: options.toolChoice };
-		} else if (isOAuthToken && options.toolChoice.name) {
-			params.tool_choice = { ...options.toolChoice, name: applyClaudeToolPrefix(options.toolChoice.name) };
-		} else {
-			params.tool_choice = options.toolChoice;
+		} else if (options.toolChoice.name) {
+			params.tool_choice = {
+				...options.toolChoice,
+				name: encodeAnthropicToolName(
+					options.toolChoice.name,
+					isOAuthToken,
+					model.compat.escapeBuiltinToolNames,
+					useUmansGatewayWebSearch,
+				),
+			};
 		}
 		// Claude Fable/Mythos 5 reject forced tool use outright ("tool_choice forces
 		// tool use is not compatible with this model"). Downgrade any/tool → auto so the
@@ -3083,7 +3176,7 @@ export function convertAnthropicMessages(
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: isOAuthToken ? applyClaudeToolPrefix(block.name) : block.name,
+						name: encodeAnthropicToolName(block.name, isOAuthToken, model.compat.escapeBuiltinToolNames),
 						// Always sanitize: the model itself can emit lone-surrogate escapes
 						// in tool-argument JSON (streamed out fine, rejected with a 400 on
 						// replay by Anthropic's strict UTF-8 validation). toWellFormedDeep
@@ -3172,8 +3265,9 @@ export function convertAnthropicMessages(
 /**
  * JSON Schema whitelist for Anthropic tool `input_schema` nodes.
  *
- * Mirrors the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`:
- * we keep only structural/metadata keywords Anthropic's validator honors, and demote
+ * Tracks the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`,
+ * with live Messages API guardrails for keywords the SDK preserves but the API rejects.
+ * We keep only structural/metadata keywords Anthropic's validator honors, and demote
  * anything else into the node's `description` as `\n\n{key: value, ...}` so the model
  * still sees the constraint as a natural-language hint.
  *
@@ -3188,7 +3282,6 @@ const ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP = new Set([
 	"definitions",
 	"type",
 	"anyOf",
-	"oneOf",
 	"allOf",
 	"enum",
 	"const",
@@ -3284,13 +3377,16 @@ function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | und
  * Applies the full whitelist semantics from the Anthropic Python SDK's
  * `lib/_parse/_transform.py::transform_schema`:
  *
- * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`/`oneOf`/`allOf`, `enum`, `const`,
- *    `description`, `title`, `default`, `nullable`) are preserved on every node.
+ * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`, `allOf`, `enum`, `const`,
+ *    `description`, `title`, `default`, `nullable`) are preserved on every node, with
+ *    one position-dependent exception: the combinator keys. Root `anyOf`/`allOf` are
+ *    spilled (recent Anthropic Messages validators reject combinators at the tool
+ *    `input_schema` root) but kept when nested; `oneOf` is spilled at every position
+ *    (it is not in the documented supported subset).
  * 2. Per-type keys are kept additively (object → `properties`/`required`/`additionalProperties`,
  *    array → `items`/`prefixItems` plus `minItems` only when 0 or 1, string → `format`
  *    only when in the supported value set).
  * 3. Everything else is demoted into the node's `description` as `\n\n{key: value, ...}`
- *    so the model still sees the constraint as a natural-language hint.
  *
  * Object nodes default to `additionalProperties: false`, but explicit open-map
  * declarations (`additionalProperties: true` or a schema literal — Zod's
@@ -3301,6 +3397,7 @@ function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | und
 function normalizeAnthropicToolSchemaNode(
 	schema: unknown,
 	cache: WeakMap<Record<string, unknown>, Record<string, unknown>>,
+	isRoot = false,
 ): unknown {
 	if (Array.isArray(schema)) return schema.map(entry => normalizeAnthropicToolSchemaNode(entry, cache));
 	if (!isRecord(schema)) return schema;
@@ -3318,7 +3415,8 @@ function normalizeAnthropicToolSchemaNode(
 	for (const key in schema) {
 		if (!Object.hasOwn(schema, key)) continue;
 		const value = schema[key];
-		if (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key)) {
+		const isRootCombinator = isRoot && COMBINATOR_KEYS.includes(key as (typeof COMBINATOR_KEYS)[number]);
+		if (!isRootCombinator && (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key))) {
 			result[key] = value;
 		} else {
 			spill.push([key, value]);
@@ -3393,7 +3491,7 @@ function normalizeAnthropicToolSchemaNode(
 }
 
 export function normalizeAnthropicToolSchema(schema: unknown): unknown {
-	return normalizeAnthropicToolSchemaNode(schema, new WeakMap());
+	return normalizeAnthropicToolSchemaNode(schema, new WeakMap(), true);
 }
 
 type AnthropicToolSchemaPlan = {
@@ -3669,6 +3767,8 @@ function convertTools(
 	isOAuthToken: boolean,
 	disableStrictTools = false,
 	supportsEagerToolInputStreaming = true,
+	escapeBuiltinToolNames = false,
+	useUmansGatewayWebSearch = false,
 ): AnthropicWireTool[] {
 	if (!tools) return [];
 	const schemaPlans = buildAnthropicToolSchemaPlans(tools, disableStrictTools);
@@ -3676,7 +3776,7 @@ function convertTools(
 	return tools.map((tool, index) => {
 		const plan = schemaPlans[index];
 		const baseTool = {
-			name: isOAuthToken ? applyClaudeToolPrefix(tool.name) : tool.name,
+			name: encodeAnthropicToolName(tool.name, isOAuthToken, escapeBuiltinToolNames, useUmansGatewayWebSearch),
 			description: tool.description || "",
 			input_schema: plan.inputSchema,
 		};

@@ -2,6 +2,90 @@
 
 ## [Unreleased]
 
+## [16.0.6] - 2026-06-18
+
+### Added
+
+- Added `transformAssistantMessage` hook to `AgentOptions` and `Agent` to allow mutating the finalized assistant message before UI emission, context appending, or tool dispatch
+
+## [16.0.5] - 2026-06-17
+
+### Breaking Changes
+
+- Changed `AgentOptions.getApiKey` and `AgentLoopConfig.getApiKey` to receive the active `Model` and return an API key or `ApiKeyResolver`, so credential routing stays model-scoped and retry context is no longer exposed through the agent-core API
+
+### Added
+
+- Added agent-loop deadline support for graceful wall-clock session stops.
+
+### Changed
+
+- Changed Gemini repetition-loop detection to live in the pi-ai stream layer instead of the agent loop. The agent no longer runs its own Gemini-gated verbatim repetition check (`detectRepetition`/`truncateRepetition`); loops now surface as a retryable transient stream error that the standard auto-retry path discards and re-samples, rather than a committed contentful error message.
+
+### Fixed
+
+- Fixed `PI_DIALECT=minimax` being ignored by the owned tool-calling env selector. ([#2759](https://github.com/can1357/oh-my-pi/issues/2759))
+
+## [16.0.1] - 2026-06-15
+
+### Fixed
+
+- Fixed transient provider errors after streamed tool-call arguments so incomplete tool calls are marked as interrupted output instead of eligible for automatic retry ([#2683](https://github.com/can1357/oh-my-pi/issues/2683)).
+- Fixed `@oh-my-pi/pi-agent-core` telemetry content capture crashing every chat turn with `TypeError: systemPrompt.map is not a function` when `captureMessageContent` is enabled (`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`). `ChatRequestSnapshot.systemPrompt` now accepts `string | readonly string[]` and the telemetry serializers normalize a bare string to a single-element array — previously the full-system serializer called `.map` on a string (the `.length` guard passed, so it threw) and the request-message serializer iterated the string into one `system` message per character.
+
+## [16.0.0] - 2026-06-15
+
+### Breaking Changes
+
+- Renamed owned tool-calling options from `toolCallSyntax`/`exampleSyntax` to `dialect`/`exampleDialect`.
+- Changed compaction conversation serialization to use the target model's native dialect turn, thinking, tool-call, and tool-result envelopes when a dialect is selected.
+- Renamed the owned dialect environment variable from `PI_OWNED_TOOLS` to `PI_DIALECT`.
+
+### Added
+
+- Added `onTurnEnd` hook support (`setOnTurnEnd`/`onTurnEnd`) to run awaited per-turn bookkeeping with current messages before the next model request and skip callback execution for aborted or error turns
+
+### Changed
+
+- Renamed `toolCallSyntax` option to `dialect` in AgentOptions and AgentLoopConfig
+- Updated conversation serialization to use dialect's native transcript rendering when a dialect is selected
+- Changed internal references from `ToolCallSyntax` type to `Dialect` type across agent loop and compaction modules
+
+## [15.13.3] - 2026-06-15
+
+### Added
+
+- Added the `interruptible` tool field: when set, the agent loop may abort the tool mid-execution to deliver a queued steering message (honored only in `immediate` interrupt mode).
+- Added support for `gemini` and `gemma` as valid owned tool syntax values in environment configuration
+
+### Fixed
+
+- Fixed `pruneToolOutputs` blanking tiny tool results during overflow pruning: results below `50` tokens (`MIN_PRUNE_TOKENS`) are no longer replaced with the `[Output truncated - N tokens]` placeholder, which cost more tokens than the result itself and churned the prompt cache for zero savings.
+
+## [15.13.2] - 2026-06-15
+
+### Breaking Changes
+
+- Removed `harmony-leak` exports from the `@oh-my-pi/pi-agent-core` package entrypoint
+- Replaced the experimental `promptToolCalls` agent/loop option with `toolCallSyntax`, selecting an explicit in-band tool-call grammar instead of a boolean GLM-only mode.
+
+### Added
+
+- Added support for selecting owned in-band tool-call syntax via `PI_OWNED_TOOLS=<syntax>` (for example `hermes` or `qwen3`) while preserving legacy `PI_OWNED_TOOLS=1/true` as GLM mode
+- Added owned in-band tool calling for multiple syntaxes (`glm`, `hermes`, `kimi`, `xml`, `anthropic`, `deepseek`, `harmony`, `pi-native`, `qwen3`). Owned mode sends no native provider tools, appends a syntax-specific prompt/catalog, re-encodes prior tool calls/results as grammar-owned text, and parses streamed model output back into canonical tool calls.
+- Added tool-example folding to `normalizeTools`: when given a model's affinity syntax (resolved via `preferredToolSyntax`), it renders each tool's `examples` into an `<examples>` block in that native syntax and appends it to the wire description. Wired through both context paths (fresh build and append-only `takeSnapshot`/`build` via a new `exampleSyntax` build option), with the `_i` intent-field placeholder added to examples when intent tracing injects it.
+- Added the `abortOnFabricatedToolResult` option to `AgentOptions`/`AgentLoopConfig` (default `true`): when owned tool calling is active and the model fabricates a tool result mid-turn, `true` aborts the provider request immediately while `false` lets it finish and discards the fabricated continuation.
+
+### Changed
+
+- Added owned in-band syntax support to `Agent` loop configuration resolution by selecting syntax from `toolCallSyntax` or `PI_OWNED_TOOLS` when present
+
+### Fixed
+
+- Fixed append-only context cache fingerprinting to account for `exampleSyntax`, so switching tool-call syntax rebuilds cached prompts with the correct injected tool examples
+- Fixed owned in-band tool-calling requests to omit `toolChoice` after stripping native tools, preventing invalid tool-choice requests
+- Fixed owned tool calling letting the model fabricate tool results by treating grammar-owned tool-result markers in assistant text as a hard turn boundary: calls before the fabrication are kept, fabricated results and dependent calls are dropped, and the real result is fed back on the next turn.
+
 ## [15.13.1] - 2026-06-15
 
 ### Added

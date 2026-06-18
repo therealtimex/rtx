@@ -44,26 +44,9 @@ function hasPasteText(value: unknown): value is PasteTarget {
 	return typeof value === "object" && value !== null && typeof (value as PasteTarget).pasteText === "function";
 }
 
-/** Wrap pasted text in a fenced code block, using a backtick fence longer than any run of
- *  backticks already in the content so an embedded fence cannot terminate the block early. */
-function wrapPasteInCodeBlock(content: string): string {
-	let longestRun = 0;
-	let run = 0;
-	for (let i = 0; i < content.length; i++) {
-		if (content.charCodeAt(i) === 96 /* backtick */) {
-			run++;
-			if (run > longestRun) longestRun = run;
-		} else {
-			run = 0;
-		}
-	}
-	const fence = "`".repeat(Math.max(3, longestRun + 1));
-	return `${fence}\n${content}\n${fence}`;
-}
-
-/** Wrap pasted text in `<pasted_text>` tags so the model treats it as one quoted block. */
-function wrapPasteInXml(content: string): string {
-	return `<pasted_text>\n${content}\n</pasted_text>`;
+/** Wrap pasted text in `<attachment>` tags so the model treats it as one quoted block. */
+function wrapPasteInAttachmentBlock(content: string): string {
+	return `<attachment>\n${content}\n</attachment>`;
 }
 
 const TINY_TITLE_PROGRESS_DONE_TTL_MS = 3_000;
@@ -95,12 +78,13 @@ export class InputController {
 
 	#enhancedPaste?: EnhancedPasteController;
 	#focusedLeftTapListenerInstalled = false;
+	#btwBranchListenerInstalled = false;
 	// Tap counter for the double-← gesture; reset whenever a quiet gap
 	// (>= LEFT_DOUBLE_TAP_MAX_GAP_MS) starts a fresh sequence. See
 	// #detectLeftDoubleTap.
 	#leftTapCount = 0;
-	// Sequential index for `local://attachment-N` references created by the large-paste "attach as
-	// file" action. Seeded from 0 and bumped past any existing attachment files in #attachPasteAsFile.
+	// Sequential index for `local://attachment-N` references created by the large-paste local-file
+	// action. Seeded from 0 and bumped past any existing attachment files in #attachPasteAsFile.
 	#attachmentCounter = 0;
 
 	#showTinyTitleDownloadProgress(modelKey: string): void {
@@ -157,6 +141,16 @@ export class InputController {
 				if (!matchesKey(data, "left")) return undefined;
 				if (this.ctx.editor.getText().trim()) return undefined;
 				this.#handleFocusedLeftTap();
+				return { consume: true };
+			});
+		}
+		if (!this.#btwBranchListenerInstalled) {
+			this.#btwBranchListenerInstalled = true;
+			this.ctx.ui.addInputListener(data => {
+				if (!matchesKey(data, "b")) return undefined;
+				if (!this.ctx.canBranchBtw()) return undefined;
+				if (this.ctx.editor.getText().trim()) return undefined;
+				void this.ctx.handleBtwBranchKey();
 				return { consume: true };
 			});
 		}
@@ -321,6 +315,8 @@ export class InputController {
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
+		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
+		this.ctx.editor.onRetry = () => void this.handleRetry();
 		this.ctx.editor.clearCustomKeyHandlers();
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
@@ -500,6 +496,7 @@ export class InputController {
 						cancelled: false,
 						started: true,
 						synthetic: true,
+						userInitiated: true,
 					});
 				}
 				return;
@@ -706,11 +703,17 @@ export class InputController {
 				this.ctx.pendingImages = [];
 				this.ctx.pendingImageLinks = [];
 
-				// Render user message immediately, then let session events catch up
+				// Render user message immediately, then let session events catch up.
+				// Tag the submission as "steer": this is a normal Enter the controller
+				// believed was idle, but a background turn can start in the gap before
+				// `submitInteractiveInput` dispatches it. Steering matches the
+				// streaming-branch Enter (above) and keeps the message from throwing
+				// AgentBusyError on that race.
 				const submission = this.ctx.startPendingSubmission({
 					text,
 					images,
 					imageLinks: inputImageLinks,
+					streamingBehavior: "steer",
 				});
 
 				this.ctx.onInputCallback(submission);
@@ -718,21 +721,25 @@ export class InputController {
 				// No input waiter: the main loop is between turns (post-turn
 				// epilogue, retry backoff, or a scheduled continue) with the agent
 				// momentarily idle. The editor already cleared itself on Enter, so
-				// falling through here would silently swallow the message. Queue it
-				// as a steer instead: the idle drain in #queueSteer delivers it
-				// immediately when the session is resumable, and a retry/continue
-				// run picks it up at loop start otherwise.
+				// falling through here would silently swallow the message. Submit a
+				// real prompt directly; if a background turn starts in the gap,
+				// `streamingBehavior: "steer"` preserves the typed-message queueing
+				// semantics instead of throwing AgentBusyError.
 				this.ctx.editor.imageLinks = undefined;
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.pendingImages = [];
 				this.ctx.pendingImageLinks = [];
 				try {
-					await this.ctx.withLocalSubmission(text, () => this.ctx.session.steer(text, images), {
-						imageCount: images?.length ?? 0,
-					});
+					await this.ctx.withLocalSubmission(
+						text,
+						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						{
+							imageCount: images?.length ?? 0,
+						},
+					);
 				} catch (error) {
 					// Don't lose the message: hand the text and images back to the
-					// editor so the user can retry (e.g. steer() rejecting an
+					// editor so the user can retry (e.g. prompt dispatch rejecting an
 					// extension command).
 					this.ctx.editor.setText(text);
 					if (images && images.length > 0) {
@@ -931,6 +938,22 @@ export class InputController {
 		return true;
 	}
 
+	async handleRetry(): Promise<void> {
+		if (this.ctx.collabGuest) {
+			this.ctx.showStatus("/retry is host-only during a collab session");
+			return;
+		}
+		const didRetry = await this.ctx.viewSession.retry();
+		if (didRetry) {
+			this.ctx.editor.setText("");
+			this.ctx.pendingImages = [];
+			this.ctx.pendingImageLinks = [];
+			this.ctx.editor.imageLinks = undefined;
+		} else {
+			this.ctx.showStatus("Nothing to retry");
+		}
+	}
+
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
 		let text = this.ctx.editor.getText().trim();
@@ -1004,7 +1027,9 @@ export class InputController {
 
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
 		this.ctx.locallySubmittedUserSignatures.clear();
-		const { steering, followUp } = this.ctx.session.clearQueue();
+		// On Esc (abort) drop non-user internal steers so the post-abort drain can't
+		// auto-resume; plain Alt+Up dequeue preserves them for the continuing stream.
+		const { steering, followUp } = this.ctx.session.clearQueue({ forInterrupt: options?.abort });
 		// Messages typed while compacting live in `compactionQueuedMessages`, not the
 		// agent queue `clearQueue()` drains — but the pending bar shows the same
 		// "Alt+Up to edit" hint for them (ui-helpers `updatePendingMessagesDisplay`).
@@ -1282,24 +1307,24 @@ export class InputController {
 	}
 
 	/**
-	 * Present the large-paste menu and apply the chosen action: wrap in a code block or in XML tags
-	 * (both collapse to a `[Paste]` marker that expands on submit), or save the text to a file and
-	 * reference its path so the agent can `read` it on demand. Cancelling (Esc) falls back to the
-	 * default inline paste marker, so the pasted content is never lost.
+	 * Present the large-paste menu and apply the chosen action: wrap in `<attachment>` tags (collapsed
+	 * to a `[Paste]` marker that expands on submit), save the text to a file and reference its path so
+	 * the agent can `read` it on demand, or paste inline. Cancelling (Esc) falls back to the default
+	 * inline paste marker, so the pasted content is never lost.
 	 */
 	async presentLargePasteMenu(text: string, lineCount: number): Promise<void> {
-		const CODE_BLOCK = "Wrap in a code block";
-		const XML = "Wrap in XML tags";
-		const FILE = "Attach as a file";
+		const WRAPPED_BLOCK = "Attach as a wrapped block";
+		const LOCAL_FILE = "Attach as local file";
+		const INLINE = "Paste inline";
 
 		let choice: string | undefined;
 		try {
 			choice = await this.ctx.showHookSelector(
 				`Pasted ${lineCount} lines`,
 				[
-					{ label: CODE_BLOCK, description: "Fence the text in a ``` block, collapsed to a marker" },
-					{ label: XML, description: "Wrap the text in <pasted_text> tags, collapsed to a marker" },
-					{ label: FILE, description: "Save the text to a file and reference its path" },
+					{ label: WRAPPED_BLOCK, description: "Wrap the text in <attachment> tags, collapsed to a marker" },
+					{ label: LOCAL_FILE, description: "Save the text to a local://attachment file" },
+					{ label: INLINE, description: "Collapse the text to an inline paste marker" },
 				],
 				{ helpText: "Esc to paste inline" },
 			);
@@ -1309,14 +1334,14 @@ export class InputController {
 		}
 
 		switch (choice) {
-			case CODE_BLOCK:
-				this.ctx.editor.insertPaste(wrapPasteInCodeBlock(text));
+			case WRAPPED_BLOCK:
+				this.ctx.editor.insertPaste(wrapPasteInAttachmentBlock(text));
 				break;
-			case XML:
-				this.ctx.editor.insertPaste(wrapPasteInXml(text));
-				break;
-			case FILE:
+			case LOCAL_FILE:
 				await this.#attachPasteAsFile(text, lineCount);
+				break;
+			case INLINE:
+				this.ctx.editor.insertPaste(text);
 				break;
 			default:
 				// Esc / cancel: keep the original behavior — collapse to an inline paste marker.

@@ -46,6 +46,8 @@ import type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
+	SessionStopEvent,
+	SessionStopEventResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -135,7 +137,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 				? SessionBeforeTreeResult | undefined
 				: TEvent extends { type: "session.compacting" }
 					? SessionCompactingResult | undefined
-					: undefined;
+					: TEvent extends { type: "session_stop" }
+						? SessionStopEventResult | undefined
+						: undefined;
 
 export type NewSessionHandler = (options?: {
 	parentSession?: string;
@@ -320,6 +324,10 @@ export class ExtensionRunner {
 			return;
 		}
 		await this.emit({ type: "credential_disabled", ...event });
+	}
+
+	async emitSessionStop(event: Omit<SessionStopEvent, "type">): Promise<SessionStopEventResult | undefined> {
+		return await this.emit({ type: "session_stop", ...event });
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -543,7 +551,9 @@ export class ExtensionRunner {
 			event.type === "session_before_tree"
 		);
 	}
-
+	#isSessionShutdownEvent(event: RunnerEmitEvent): event is Extract<RunnerEmitEvent, { type: "session_shutdown" }> {
+		return event.type === "session_shutdown";
+	}
 	async #runHandlerWithTimeout<TEvent extends { type: string }, TResult>(
 		handler: (event: TEvent, ctx: ExtensionContext) => Promise<TResult | undefined> | TResult | undefined,
 		event: TEvent,
@@ -586,7 +596,21 @@ export class ExtensionRunner {
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
 		const ctx = this.createContext();
-		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
+		let result: SessionBeforeEventResult | SessionCompactingResult | SessionStopEventResult | undefined;
+
+		if (this.#isSessionShutdownEvent(event)) {
+			const timeoutMs = handlerTimeoutForEvent(event.type);
+			const promises: Promise<unknown>[] = [];
+			for (const ext of this.extensions) {
+				const handlers = ext.handlers.get(event.type);
+				if (!handlers || handlers.length === 0) continue;
+				for (const handler of handlers) {
+					promises.push(this.#runHandlerWithTimeout(handler, event, ctx, ext, timeoutMs));
+				}
+			}
+			await Promise.all(promises);
+			return result as RunnerEmitResult<TEvent>;
+		}
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(event.type);
@@ -610,6 +634,16 @@ export class ExtensionRunner {
 
 				if (event.type === "session.compacting" && handlerResult) {
 					result = handlerResult as SessionCompactingResult;
+				}
+
+				if (event.type === "session_stop" && handlerResult) {
+					result = handlerResult as SessionStopEventResult;
+					const hasContinuationContext =
+						(typeof result.additionalContext === "string" && result.additionalContext.length > 0) ||
+						(typeof result.reason === "string" && result.reason.length > 0);
+					if ((result.continue === true || result.decision === "block") && hasContinuationContext) {
+						return result as RunnerEmitResult<TEvent>;
+					}
 				}
 			}
 		}

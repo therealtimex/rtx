@@ -1,6 +1,5 @@
 import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
-import { calculatePromptTokens } from "@oh-my-pi/pi-agent-core/compaction/compaction";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
@@ -22,7 +21,7 @@ import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { vocalizer } from "../../tts/vocalizer";
-import { hasVisibleThinking } from "../../utils/thinking-display";
+import { canonicalizeMessage } from "../../utils/thinking-display";
 import { interruptHint } from "../shared";
 import { StreamingRevealController } from "./streaming-reveal";
 import { ToolArgsRevealController } from "./tool-args-reveal";
@@ -480,8 +479,8 @@ export class EventController {
 
 			const visibleBlockCount = this.ctx.streamingMessage.content.filter(
 				content =>
-					(content.type === "text" && content.text.trim().length > 0) ||
-					(content.type === "thinking" && hasVisibleThinking(content)),
+					(content.type === "text" && canonicalizeMessage(content.text)) ||
+					(content.type === "thinking" && canonicalizeMessage(content.thinking)),
 			).length;
 			if (visibleBlockCount > this.#lastVisibleBlockCount) {
 				this.#resetReadGroup();
@@ -1107,11 +1106,7 @@ export class EventController {
 	}
 
 	#currentContextTokens(): number {
-		const lastAssistant = this.ctx.viewSession.agent.state.messages
-			.slice()
-			.reverse()
-			.find((m): m is AssistantMessage => m.role === "assistant" && m.stopReason !== "aborted");
-		return lastAssistant?.usage ? calculatePromptTokens(lastAssistant.usage) : 0;
+		return this.ctx.viewSession.getContextUsage()?.tokens ?? 0;
 	}
 
 	sendCompletionNotification(): void {

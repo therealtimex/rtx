@@ -240,13 +240,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const hadArgs = !!command.args;
-			// Capture state BEFORE the call: when plan mode is already active,
-			// handlePlanModeCommand may exit it (on confirmed exit) or leave it on (on cancel
-			// or warning). In every "already active" case the typed args are NOT consumed,
-			// so preserve them in history regardless of the user's confirm/cancel choice.
-			const wasPlanModeEnabled = runtime.ctx.planModeEnabled;
 			await runtime.ctx.handlePlanModeCommand(command.args || undefined);
-			if (hadArgs && wasPlanModeEnabled) {
+			if (hadArgs) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
 			runtime.ctx.editor.setText("");
@@ -275,10 +270,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const hadArgs = !!command.args;
-			// Capture state BEFORE the call (see /plan above for rationale).
-			const wasGoalModeEnabled = runtime.ctx.goalModeEnabled;
 			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
-			if (hadArgs && wasGoalModeEnabled) {
+			if (hadArgs) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
 			runtime.ctx.editor.setText("");
@@ -308,7 +301,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "model",
 		aliases: ["models"],
-		description: "Select model (opens selector UI)",
+		description: "Switch model for this session",
 		acpDescription: "Show current model selection",
 		handle: async (command, runtime) => {
 			if (command.args) {
@@ -341,7 +334,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			return commandConsumed();
 		},
 		handleTui: (_command, runtime) => {
-			runtime.ctx.showModelSelector();
+			runtime.ctx.showModelSelector({ temporaryOnly: true });
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -420,6 +413,103 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "advisor",
+		description: "Toggle the advisor (a second model that reviews each turn and injects notes)",
+		acpDescription: "Toggle advisor",
+		acpInputHint: "[on|off|status|dump [raw]]",
+		subcommands: [
+			{ name: "on", description: "Enable the advisor" },
+			{ name: "off", description: "Disable the advisor" },
+			{ name: "status", description: "Show advisor status" },
+			{ name: "dump", description: "Copy the advisor's transcript to clipboard", usage: "[raw]" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const { verb, rest } = parseSubcommand(command.args);
+			if (!verb || verb === "toggle") {
+				const active = runtime.session.toggleAdvisorEnabled();
+				const configured = runtime.session.isAdvisorEnabled();
+				if (active) {
+					await runtime.output("Advisor enabled.");
+				} else if (configured) {
+					await runtime.output("Advisor setting enabled, but no model is assigned to the 'advisor' role.");
+				} else {
+					await runtime.output("Advisor disabled.");
+				}
+				return commandConsumed();
+			}
+			if (verb === "on") {
+				const active = runtime.session.setAdvisorEnabled(true);
+				await runtime.output(
+					active ? "Advisor enabled." : "Advisor setting enabled, but no model is assigned to the 'advisor' role.",
+				);
+				return commandConsumed();
+			}
+			if (verb === "off") {
+				runtime.session.setAdvisorEnabled(false);
+				await runtime.output("Advisor disabled.");
+				return commandConsumed();
+			}
+			if (verb === "status") {
+				await runtime.output(runtime.session.formatAdvisorStatus());
+				return commandConsumed();
+			}
+			if (verb === "dump") {
+				const isRaw = rest.toLowerCase() === "raw";
+				const text = runtime.session.formatAdvisorHistoryAsText({ compact: !isRaw });
+				await runtime.output(text ?? "Advisor is not active for this session.");
+				return commandConsumed();
+			}
+			return usage("Usage: /advisor [on|off|status|dump [raw]]", runtime);
+		},
+		handleTui: async (command, runtime) => {
+			const { verb, rest } = parseSubcommand(command.args);
+			if (!verb || verb === "toggle") {
+				const active = runtime.ctx.session.toggleAdvisorEnabled();
+				const configured = runtime.ctx.session.isAdvisorEnabled();
+				if (active) {
+					runtime.ctx.showStatus("Advisor enabled.");
+				} else if (configured) {
+					runtime.ctx.showStatus("Advisor setting enabled, but no model is assigned to the 'advisor' role.");
+				} else {
+					runtime.ctx.showStatus("Advisor disabled.");
+				}
+				refreshStatusLine(runtime.ctx);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (verb === "on") {
+				const active = runtime.ctx.session.setAdvisorEnabled(true);
+				runtime.ctx.showStatus(
+					active ? "Advisor enabled." : "Advisor setting enabled, but no model is assigned to the 'advisor' role.",
+				);
+				refreshStatusLine(runtime.ctx);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (verb === "off") {
+				runtime.ctx.session.setAdvisorEnabled(false);
+				runtime.ctx.showStatus("Advisor disabled.");
+				refreshStatusLine(runtime.ctx);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (verb === "status") {
+				await runtime.ctx.handleAdvisorStatusCommand();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (verb === "dump") {
+				const isRaw = rest.toLowerCase() === "raw";
+				runtime.ctx.handleAdvisorDumpCommand(isRaw);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /advisor [on|off|status|dump [raw]]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "export",
 		description: "Export session to HTML file",
 		inlineHint: "[path]",
@@ -450,13 +540,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "dump",
 		description: "Copy session transcript to clipboard",
 		acpDescription: "Return full transcript as plain text",
+		allowArgs: true,
 		handle: async (_command, runtime) => {
 			const text = runtime.session.formatSessionAsText();
 			await runtime.output(text || "No messages to dump yet.");
 			return commandConsumed();
 		},
-		handleTui: async (_command, runtime) => {
-			await runtime.ctx.handleDumpCommand();
+		handleTui: (_command, runtime) => {
+			runtime.ctx.handleDumpCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},
