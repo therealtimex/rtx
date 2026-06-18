@@ -47,7 +47,7 @@ export const commands: CommandEntry[] = [
 const RESERVED_TOP_LEVEL_WORDS = new Map<string, string>([
 	[
 		"extensions",
-		'`omp extensions` is not a management command. Use `omp plugin list` / `omp plugin install`, or run `omp launch extensions` if you meant to send "extensions" as a prompt.',
+		'`rtx extensions` is not a management command. Use `rtx plugin list` / `rtx plugin install`, or run `rtx launch extensions` if you meant to send "extensions" as a prompt.',
 	],
 ]);
 

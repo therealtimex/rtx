@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Rebranded the default app/config directory constants from `omp`/`.omp` to `rtx`/`.rtx`.
+
 ## [16.0.3] - 2026-06-16
 
 ### Added

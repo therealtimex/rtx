@@ -1,19 +1,19 @@
-# Build self-contained `omp` binaries on GitHub-hosted runners and publish them
+# Build self-contained `rtx` binaries on GitHub-hosted runners and publish them
 # as release assets. Asset names match what the installers download:
-#   scripts/install.sh  -> omp-<darwin|linux>-<x64|arm64>
-#   scripts/install.ps1 -> omp-windows-x64.exe
+#   scripts/install.sh  -> rtx-<darwin|linux>-<x64|arm64>
+#   scripts/install.ps1 -> rtx-windows-x64.exe
 #
 # Stages per job (the flow proven to build locally in R1):
 #   1. Build the Rust napi native(s) — x64 needs BOTH tiers (modern + baseline);
 #      arm64 is a single build.
-#   2. `bun run build` (build-binary.ts) embeds native + Bun runtime -> dist/omp[.exe].
+#   2. `bun run build` (build-binary.ts) embeds native + Bun runtime -> dist/rtx[.exe].
 #   3. Rename to the asset name, upload as an artifact, and (on a `v*` tag)
 #      attach to the GitHub release.
 #
 # Run manually (Actions -> Run workflow) for downloadable artifacts, or push a
 # `v*` tag to also publish them as release assets.
 
-name: Release omp binaries
+name: Release rtx binaries
 
 on:
   workflow_dispatch: {}
@@ -36,21 +36,21 @@ jobs:
       matrix:
         include:
           - os: macos-14 # Apple Silicon
-            asset: omp-darwin-arm64
+            asset: rtx-darwin-arm64
             dual_tier: false
           - os: macos-13 # Intel
-            asset: omp-darwin-x64
+            asset: rtx-darwin-x64
             dual_tier: true
           - os: ubuntu-latest
-            asset: omp-linux-x64
+            asset: rtx-linux-x64
             dual_tier: true
             linux: true
           - os: ubuntu-24.04-arm # GitHub-hosted ARM64 Linux runner
-            asset: omp-linux-arm64
+            asset: rtx-linux-arm64
             dual_tier: false
             linux: true
           - os: windows-latest
-            asset: omp-windows-x64.exe
+            asset: rtx-windows-x64.exe
             dual_tier: true
             windows: true
 
@@ -96,8 +96,8 @@ jobs:
 
       - name: Stage release asset
         run: |
-          src="packages/coding-agent/dist/omp"
-          [ "${{ matrix.windows }}" = "true" ] && src="packages/coding-agent/dist/omp.exe"
+          src="packages/coding-agent/dist/rtx"
+          [ "${{ matrix.windows }}" = "true" ] && src="packages/coding-agent/dist/rtx.exe"
           mv "$src" "${{ matrix.asset }}"
           chmod +x "${{ matrix.asset }}" || true
           ls -lh "${{ matrix.asset }}"

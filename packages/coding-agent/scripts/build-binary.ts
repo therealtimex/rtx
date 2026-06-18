@@ -5,7 +5,7 @@ import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
 const repoRoot = path.join(packageDir, "..", "..");
-const outputPath = path.join(packageDir, "dist", "omp");
+const outputPath = path.join(packageDir, "dist", "rtx");
 
 // Transformers.js is an optional, native-heavy dependency that is never bundled
 // into the binary; the tiny-model worker `bun install`s it into a runtime cache
@@ -83,7 +83,7 @@ async function main(): Promise<void> {
 					"./packages/coding-agent/src/extensibility/legacy-pi-ai-shim.ts",
 					"./packages/coding-agent/src/extensibility/legacy-pi-coding-agent-shim.ts",
 					"--outfile",
-					"packages/coding-agent/dist/omp",
+					"packages/coding-agent/dist/rtx",
 				],
 				buildEnv,
 				repoRoot,

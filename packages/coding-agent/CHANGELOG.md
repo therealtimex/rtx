@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Rebranded user-facing CLI surfaces from `omp` to `rtx`, including the package binary, compiled binary output, release asset names, installers, README command examples, help text, and the welcome logo.
+
 ## [16.0.6] - 2026-06-18
 
 ### Added
