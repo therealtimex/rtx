@@ -2,18 +2,21 @@
  * Update CLI command handler.
  *
  * Handles `rtx update` to check for and install updates.
- * Uses the installer that owns the active rtx executable when it can be detected.
+ * Downloads and installs the matching rtx binary from this fork's GitHub releases.
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import { theme } from "../modes/theme/theme";
+import {
+	fetchLatestRtxRelease,
+	findRtxReleaseAsset,
+	getRtxReleaseAssetName,
+	type RtxReleaseInfo,
+} from "./rtx-release";
 
-const REPO = "can1357/oh-my-pi";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
@@ -21,11 +24,11 @@ const MISE_TOOL = "github:can1357/oh-my-pi";
  * Official npm registry origin.
  *
  * Pinned across both the version check and the bun install step so the two
- * agree on which catalog they are talking to. A user's bun may be pointed at
- * an unofficial mirror (corporate proxy, Taobao, etc.) that lags the upstream
- * registry by minutes-to-hours, in which case `getLatestRelease` would resolve
- * a version the mirror has not yet replicated and the install would fail with
- * `No version matching "X" found for specifier "<pkg>" (but package exists)`.
+ * agree on which catalog they are talking to. A user's bun may be pointed at an
+ * unofficial mirror (corporate proxy, Taobao, etc.) that lags the upstream
+ * registry by minutes-to-hours, in which case a registry lookup would resolve a
+ * version the mirror has not yet replicated and the install would fail with `No
+ * version matching "X" found for specifier "<pkg>" (but package exists)`.
  * See #1686.
  */
 const NPM_REGISTRY = "https://registry.npmjs.org/";
@@ -57,11 +60,6 @@ function currentNativeTag(): string {
 	return `${process.platform}-${process.arch}`;
 }
 
-interface ReleaseInfo {
-	tag: string;
-	version: string;
-}
-
 /** Result from running the installed binary and parsing its reported version. */
 export interface InstalledVersionVerification {
 	ok: boolean;
@@ -91,58 +89,6 @@ export function parseUpdateArgs(args: string[]): { force: boolean; check: boolea
 		force: args.includes("--force") || args.includes("-f"),
 		check: args.includes("--check") || args.includes("-c"),
 	};
-}
-
-async function getBunGlobalBinDir(): Promise<string | undefined> {
-	if (!$which("bun")) return undefined;
-	try {
-		const result = await $`bun pm bin -g`.quiet().nothrow();
-		if (result.exitCode !== 0) return undefined;
-		const output = result.text().trim();
-		return output.length > 0 ? output : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function getHomebrewFormulaPrefix(): Promise<string | undefined> {
-	if (!$which("brew")) return undefined;
-	for (const formula of [HOMEBREW_FORMULA, APP_NAME]) {
-		try {
-			const result = await $`brew --prefix ${formula}`.quiet().nothrow();
-			if (result.exitCode !== 0) continue;
-			const output = result.text().trim();
-			if (output.length > 0) return output;
-		} catch {}
-	}
-	return undefined;
-}
-
-async function getMiseBinDirs(): Promise<string[]> {
-	if (!$which("mise")) return [];
-	try {
-		const result = await $`mise bin-paths ${MISE_TOOL}`.quiet().nothrow();
-		if (result.exitCode !== 0) return [];
-		return result
-			.text()
-			.split(/\r?\n/)
-			.map(line => line.trim())
-			.filter(line => line.length > 0);
-	} catch {
-		return [];
-	}
-}
-
-function getMiseDataDir(): string {
-	const override = process.env.MISE_DATA_DIR;
-	if (override && override.length > 0) return override;
-	if (process.platform === "win32") {
-		const localAppData = process.env.LOCALAPPDATA;
-		if (localAppData && localAppData.length > 0) return path.join(localAppData, "mise");
-	}
-	const xdgDataHome = process.env.XDG_DATA_HOME;
-	if (xdgDataHome && xdgDataHome.length > 0) return path.join(xdgDataHome, "mise");
-	return path.join(os.homedir(), ".local", "share", "mise");
 }
 
 function normalizePathForComparison(filePath: string): string {
@@ -193,8 +139,6 @@ interface UpdateMethodResolutionOptions {
 	miseDataDir?: string;
 }
 
-type UpdateTarget = { method: "brew" } | { method: "mise" } | { method: "bun" } | { method: "binary"; path: string };
-
 function resolveUpdateMethod(
 	ompPath: string,
 	bunBinDir: string | undefined,
@@ -215,43 +159,12 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
-async function resolveUpdateTarget(): Promise<UpdateTarget> {
-	const bunBinDir = await getBunGlobalBinDir();
-	const homebrewPrefix = await getHomebrewFormulaPrefix();
-	const miseAvailable = $which("mise") !== undefined;
-	const miseBinDirs = miseAvailable ? await getMiseBinDirs() : [];
-	const miseDataDir = miseAvailable ? getMiseDataDir() : undefined;
-	const ompPath = resolveOmpPath();
-
-	if (ompPath) {
-		const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir });
-		if (method === "binary") return { method, path: ompPath };
-		return { method };
-	}
-
-	if (bunBinDir) return { method: "bun" };
-
-	throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
-}
 
 /**
- * Get the latest release info from the npm registry.
- * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
+ * Get the latest release info from the GitHub release channel used by this fork.
  */
-async function getLatestRelease(): Promise<ReleaseInfo> {
-	const response = await fetch(`${NPM_REGISTRY}${PACKAGE}/latest`);
-	if (!response.ok) {
-		throw new Error(`Failed to fetch release info: ${response.statusText}`);
-	}
-
-	const data = (await response.json()) as { version: string };
-	const version = data.version;
-	const tag = `v${version}`;
-
-	return {
-		tag,
-		version,
-	};
+async function getLatestRelease(): Promise<RtxReleaseInfo> {
+	return fetchLatestRtxRelease();
 }
 
 /**
@@ -261,85 +174,37 @@ async function getLatestRelease(): Promise<ReleaseInfo> {
  * - positive if a > b
  */
 function compareVersions(a: string, b: string): number {
-	const pa = a.split(".").map(Number);
-	const pb = b.split(".").map(Number);
-
-	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-		const na = pa[i] || 0;
-		const nb = pb[i] || 0;
-		if (na !== nb) return na - nb;
-	}
-	return 0;
+	return Bun.semver.order(a, b);
 }
 
 /**
- * Get the appropriate binary name for this platform.
+ * Resolve the path that the rtx app name maps to in the user's PATH.
  */
-function getBinaryName(): string {
-	const platform = process.platform;
-	const arch = process.arch;
-
-	let os: string;
-	switch (platform) {
-		case "linux":
-			os = "linux";
-			break;
-		case "darwin":
-			os = "darwin";
-			break;
-		case "win32":
-			os = "windows";
-			break;
-		default:
-			throw new Error(`Unsupported platform: ${platform}`);
-	}
-
-	let archName: string;
-	switch (arch) {
-		case "x64":
-			archName = "x64";
-			break;
-		case "arm64":
-			archName = "arm64";
-			break;
-		default:
-			throw new Error(`Unsupported architecture: ${arch}`);
-	}
-
-	if (os === "windows") {
-		return `${APP_NAME}-${os}-${archName}.exe`;
-	}
-	return `${APP_NAME}-${os}-${archName}`;
-}
-
-/**
- * Resolve the path that `omp` maps to in the user's PATH.
- */
-function resolveOmpPath(): string | undefined {
+function resolveRtxPath(): string | undefined {
 	return $which(APP_NAME) ?? undefined;
 }
 
 /**
- * Run the resolved omp binary and check if it reports the expected version.
+ * Run the resolved rtx binary and check if it reports the expected version.
  */
 async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const ompPath = resolveOmpPath();
-	if (!ompPath) return { ok: false };
+	const rtxPath = resolveRtxPath();
+	if (!rtxPath) return { ok: false };
 	try {
-		const result = await $`${ompPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: ompPath };
+		const result = await $`${rtxPath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return { ok: false, path: rtxPath };
 		const output = result.text().trim();
-		// Output format: "omp/X.Y.Z"
+		// Output format: "rtx/X.Y.Z"
 		const match = output.match(/\/(\d+\.\d+\.\d+)/);
 		const actual = match?.[1];
-		return { ok: actual === expectedVersion, actual, path: ompPath };
+		return { ok: actual === expectedVersion, actual, path: rtxPath };
 	} catch {
-		return { ok: false, path: ompPath };
+		return { ok: false, path: rtxPath };
 	}
 }
 
 function printVerifiedVersion(expectedVersion: string): void {
-	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
+	console.log(chalk.green(`\nUpdated to ${expectedVersion}`));
 }
 
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
@@ -347,23 +212,6 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
 	}
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
-}
-
-/**
- * Print post-update verification result.
- */
-async function printVerification(expectedVersion: string): Promise<void> {
-	const result = await verifyInstalledVersion(expectedVersion);
-	if (result.ok) {
-		printVerifiedVersion(expectedVersion);
-		return;
-	}
-	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(
-		chalk.yellow(
-			`You may need to reinstall: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
-		),
-	);
 }
 
 async function unlinkIfExists(filePath: string): Promise<void> {
@@ -408,8 +256,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 /**
  * Build the bun argv used to globally install a specific omp version.
  *
- * The version is selected by hitting {@link NPM_REGISTRY} directly in
- * {@link getLatestRelease}, so the install MUST observe the same catalog:
+ * This fork updates the rtx CLI from GitHub release assets, but this helper is
+ * retained for inherited tests and package-manager compatibility. If used, the
+ * install MUST observe the same catalog as the registry lookup:
  *
  * - `--registry=${NPM_REGISTRY}` pins the install to the official registry
  *   regardless of the user's bunfig/`.npmrc`. A mirror (corporate proxy,
@@ -418,8 +267,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * - `--no-cache` tells bun to ignore its on-disk manifest snapshot so it
  *   re-fetches metadata from that registry on every invocation.
  *
- * Together these two flags make `rtx update` produce exactly the registry
- * lookup the version check just performed. See #1686.
+ * Together these two flags made the inherited package-manager update path
+ * produce exactly the registry lookup the version check just performed. See
+ * #1686.
  *
  * Also pins {@link NATIVES_PACKAGE} and the platform-specific
  * `@oh-my-pi/pi-natives-<tag>` leaf to `expectedVersion`. `bun install -g`
@@ -463,68 +313,15 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 }
 
 /**
- * Update via bun package manager.
- */
-async function updateViaBun(expectedVersion: string): Promise<void> {
-	console.log(chalk.dim("Updating via bun..."));
-	const args = buildBunInstallArgs(expectedVersion);
-	const result = await $`bun ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`bun install failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
-}
-
-async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
-	console.log(chalk.dim("Updating Homebrew formulae..."));
-	const update = await $`brew update`.nothrow();
-	if (update.exitCode !== 0) {
-		throw new Error(`brew update failed with exit code ${update.exitCode}`);
-	}
-
-	console.log(chalk.dim("Updating via Homebrew..."));
-	const args = buildHomebrewUpdateArgs(force);
-	const result = await $`brew ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`brew ${args[0]} failed with exit code ${result.exitCode}`);
-	}
-
-	await printVerification(expectedVersion);
-}
-
-async function updateViaMise(expectedVersion: string, force: boolean): Promise<void> {
-	console.log(chalk.dim("Updating via mise..."));
-	const args = buildMiseUpgradeArgs();
-	const result = await $`mise ${args}`.nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`mise upgrade failed with exit code ${result.exitCode}`);
-	}
-
-	if (force) {
-		const forceArgs = buildMiseForceInstallArgs(expectedVersion);
-		const forceResult = await $`mise ${forceArgs}`.nothrow();
-		if (forceResult.exitCode !== 0) {
-			throw new Error(`mise install --force failed with exit code ${forceResult.exitCode}`);
-		}
-	}
-
-	await printVerification(expectedVersion);
-}
-
-/**
  * Download a release binary to a target path, replacing an existing file.
  */
-async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
-	const binaryName = getBinaryName();
-	const tag = `v${expectedVersion}`;
-	const url = `https://github.com/${REPO}/releases/download/${tag}/${binaryName}`;
-
+async function updateViaBinaryAt(targetPath: string, release: RtxReleaseInfo, assetName: string): Promise<void> {
+	const asset = findRtxReleaseAsset(release, assetName);
 	const tempPath = `${targetPath}.new`;
 	const backupPath = `${targetPath}.bak`;
-	console.log(chalk.dim(`Downloading ${binaryName}…`));
+	console.log(chalk.dim(`Downloading ${asset.name}…`));
 
-	const response = await fetch(url, { redirect: "follow" });
+	const response = await fetch(asset.browser_download_url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
 		throw new Error(`Download failed: ${response.statusText}`);
 	}
@@ -536,10 +333,10 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 		targetPath,
 		tempPath,
 		backupPath,
-		expectedVersion,
+		expectedVersion: release.version,
 		verifyInstalledVersion,
 	});
-	printVerifiedVersion(expectedVersion);
+	printVerifiedVersion(release.version);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
@@ -549,8 +346,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
-	// Check for updates
-	let release: ReleaseInfo;
+	let release: RtxReleaseInfo;
 	try {
 		release = await getLatestRelease();
 	} catch (err) {
@@ -561,7 +357,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	const comparison = compareVersions(release.version, VERSION);
 
 	if (comparison <= 0 && !opts.force) {
-		console.log(chalk.green(`${theme.status.success} Already up to date`));
+		console.log(chalk.green("Already up to date"));
 		return;
 	}
 
@@ -571,25 +367,36 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
+	let assetName: string;
+	try {
+		assetName = getRtxReleaseAssetName();
+		findRtxReleaseAsset(release, assetName);
+	} catch (err) {
+		console.error(chalk.red(`Update failed: ${err}`));
+		console.error(
+			chalk.yellow(
+				`Reinstall with: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
+			),
+		);
+		process.exit(1);
+	}
+
 	if (opts.check) {
-		// Just check, don't install
+		console.log(chalk.dim(`Release asset: ${assetName}`));
 		return;
 	}
 
-	// Choose update method based on the prioritized rtx binary in PATH
 	try {
-		const target = await resolveUpdateTarget();
-		if (target.method === "brew") {
-			await updateViaHomebrew(release.version, opts.force);
-		} else if (target.method === "mise") {
-			await updateViaMise(release.version, opts.force);
-		} else if (target.method === "bun") {
-			await updateViaBun(release.version);
-		} else {
-			await updateViaBinaryAt(target.path, release.version);
-		}
+		const targetPath = resolveRtxPath();
+		if (!targetPath) throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
+		await updateViaBinaryAt(targetPath, release, assetName);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
+		console.error(
+			chalk.yellow(
+				`Reinstall with: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
+			),
+		);
 		process.exit(1);
 	}
 }

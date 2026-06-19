@@ -3,6 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	fetchLatestRtxRelease,
+	findRtxReleaseAsset,
+	getRtxReleaseAssetName,
+	normalizeGithubReleaseVersion,
+} from "@oh-my-pi/pi-coding-agent/cli/rtx-release";
+import {
 	buildBunInstallArgs,
 	buildHomebrewUpdateArgs,
 	buildMiseForceInstallArgs,
@@ -22,6 +28,61 @@ async function makeTempDir(): Promise<string> {
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
+
+describe("rtx GitHub release metadata", () => {
+	it("normalizes v-prefixed release tags", () => {
+		expect(normalizeGithubReleaseVersion("v16.0.7")).toBe("16.0.7");
+		expect(normalizeGithubReleaseVersion("16.0.7")).toBe("16.0.7");
+	});
+
+	it("rejects non-semver release tags", () => {
+		expect(() => normalizeGithubReleaseVersion("nightly")).toThrow("not a semver version");
+	});
+
+	it("maps runtime platforms to release asset names", () => {
+		expect(getRtxReleaseAssetName("darwin", "arm64")).toBe("rtx-darwin-arm64");
+		expect(getRtxReleaseAssetName("linux", "x64")).toBe("rtx-linux-x64");
+		expect(getRtxReleaseAssetName("win32", "x64")).toBe("rtx-windows-x64.exe");
+	});
+
+	it("finds the exact release asset name", () => {
+		const asset = findRtxReleaseAsset(
+			{
+				tag: "v16.0.7",
+				version: "16.0.7",
+				assets: [{ name: "rtx-darwin-arm64", browser_download_url: "https://example.test/rtx-darwin-arm64" }],
+			},
+			"rtx-darwin-arm64",
+		);
+
+		expect(asset.browser_download_url).toBe("https://example.test/rtx-darwin-arm64");
+	});
+
+	it("fetches the latest GitHub release and filters malformed assets", async () => {
+		const fetchImpl = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			expect(String(url)).toBe("https://api.github.com/repos/therealtimex/rtx/releases/latest");
+			expect(init?.headers).toEqual({ Accept: "application/vnd.github+json" });
+			return new Response(
+				JSON.stringify({
+					tag_name: "v16.0.7",
+					assets: [
+						{ name: "rtx-darwin-arm64", browser_download_url: "https://example.test/rtx-darwin-arm64" },
+						{ name: "rtx-linux-x64" },
+					],
+				}),
+			);
+		};
+
+		const release = await fetchLatestRtxRelease(fetchImpl as typeof fetch);
+
+		expect(release).toEqual({
+			tag: "v16.0.7",
+			version: "16.0.7",
+			assets: [{ name: "rtx-darwin-arm64", browser_download_url: "https://example.test/rtx-darwin-arm64" }],
+		});
+	});
+});
+
 describe("update-cli install target detection", () => {
 	it("uses bun update when prioritized omp is inside bun global bin", () => {
 		const method = resolveUpdateMethodForTest("/Users/test/.bun/bin/omp", "/Users/test/.bun/bin");
@@ -153,7 +214,7 @@ describe("update-cli binary replacement", () => {
 				expectedVersion: "15.1.8",
 				verifyInstalledVersion: async () => ({ ok: false, path: targetPath }),
 			}),
-		).rejects.toThrow("restored previous omp binary");
+		).rejects.toThrow("restored previous rtx binary");
 
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
