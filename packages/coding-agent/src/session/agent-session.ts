@@ -1300,7 +1300,7 @@ export class AgentSession {
 		if (!idle && !system && !user && !display) return;
 		try {
 			this.#powerAssertion = MacOSPowerAssertion.start({
-				reason: "Oh My Pi agent session",
+				reason: "RealtimeX agent session",
 				idle,
 				system,
 				user,

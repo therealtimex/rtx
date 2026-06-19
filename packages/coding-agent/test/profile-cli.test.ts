@@ -313,7 +313,7 @@ describe("global --profile flag", () => {
 			]);
 
 			expect(stdout, stderr).toContain("HANDLED");
-			expect(stderr).toContain("Invalid OMP profile");
+			expect(stderr).toContain("Invalid rtx profile");
 			expect(exitCode).toBe(1);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });

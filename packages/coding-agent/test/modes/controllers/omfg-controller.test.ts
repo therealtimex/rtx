@@ -10,8 +10,8 @@ import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Container, type TUI } from "@oh-my-pi/pi-tui";
 
-const PROJECT_OPTION = "This project (.omp/rules)";
-const GLOBAL_OPTION = "Global — all projects (~/.omp/agent/rules)";
+const PROJECT_OPTION = "This project (.rtx/rules)";
+const GLOBAL_OPTION = "Global — all projects (~/.rtx/agent/rules)";
 const AMEND_OPTION = "Amend with feedback…";
 
 const usage: Usage = {

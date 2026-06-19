@@ -1,8 +1,8 @@
 /**
  * Update CLI command handler.
  *
- * Handles `omp update` to check for and install updates.
- * Uses the installer that owns the active omp executable when it can be detected.
+ * Handles `rtx update` to check for and install updates.
+ * Uses the installer that owns the active rtx executable when it can be detected.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -359,7 +359,11 @@ async function printVerification(expectedVersion: string): Promise<void> {
 		return;
 	}
 	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(chalk.yellow(`You may need to reinstall: curl -fsSL https://omp.sh/install | sh`));
+	console.log(
+		chalk.yellow(
+			`You may need to reinstall: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
+		),
+	);
 }
 
 async function unlinkIfExists(filePath: string): Promise<void> {
@@ -414,7 +418,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * - `--no-cache` tells bun to ignore its on-disk manifest snapshot so it
  *   re-fetches metadata from that registry on every invocation.
  *
- * Together these two flags make `omp update` produce exactly the registry
+ * Together these two flags make `rtx update` produce exactly the registry
  * lookup the version check just performed. See #1686.
  *
  * Also pins {@link NATIVES_PACKAGE} and the platform-specific
@@ -572,7 +576,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		return;
 	}
 
-	// Choose update method based on the prioritized omp binary in PATH
+	// Choose update method based on the prioritized rtx binary in PATH
 	try {
 		const target = await resolveUpdateTarget();
 		if (target.method === "brew") {

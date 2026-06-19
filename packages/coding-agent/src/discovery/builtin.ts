@@ -1,7 +1,7 @@
 /**
- * Builtin Provider (.omp)
+ * Builtin Provider (.rtx)
  *
- * Primary provider for OMP native configs. Supports all capabilities.
+ * Primary provider for RealtimeX native configs. Supports all capabilities.
  */
 import * as path from "node:path";
 import { getAgentDir, logger, parseFrontmatter, tryParseJson } from "@oh-my-pi/pi-utils";
@@ -36,8 +36,8 @@ import {
 } from "./helpers";
 
 const PROVIDER_ID = "native";
-const DISPLAY_NAME = "OMP";
-const DESCRIPTION = "Native OMP configuration from ~/.omp and .omp/";
+const DISPLAY_NAME = "RealtimeX";
+const DESCRIPTION = "Native RealtimeX configuration from ~/.rtx and .rtx/";
 const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;

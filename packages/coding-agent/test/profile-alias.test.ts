@@ -6,7 +6,7 @@ import {
 } from "../src/cli/profile-alias";
 
 describe("profile alias installer", () => {
-	it("writes a bash-compatible function that forwards subcommands through omp", async () => {
+	it("writes a bash-compatible function that forwards subcommands through rtx", async () => {
 		const files = new Map<string, string>();
 
 		const result = await installProfileAlias({
@@ -22,9 +22,9 @@ describe("profile alias installer", () => {
 		});
 
 		expect(result.configPath).toBe("/home/me/.bashrc");
-		expect(result.command).toBe("omp --profile=work");
+		expect(result.command).toBe("rtx --profile=work");
 		expect(files.get("/home/me/.bashrc")).toContain("omp-work() {");
-		expect(files.get("/home/me/.bashrc")).toContain('command omp --profile=work "$@"');
+		expect(files.get("/home/me/.bashrc")).toContain('command rtx --profile=work "$@"');
 	});
 
 	it("resolves source invocations without forcing the source checkout as cwd", () => {
@@ -36,7 +36,7 @@ describe("profile alias installer", () => {
 		expect(command.powerShell).toBe("'/bin/bun' '/repo/packages/coding-agent/src/cli.ts'");
 	});
 
-	it("can target the current source invocation instead of the installed omp binary", async () => {
+	it("can target the current source invocation instead of the installed rtx binary", async () => {
 		const files = new Map<string, string>();
 
 		const result = await installProfileAlias({
@@ -100,9 +100,9 @@ describe("profile alias installer", () => {
 			},
 		});
 
-		const content = files.get("/Users/me/.config/fish/conf.d/omp-profiles.fish") ?? "";
-		expect(content).toContain("function omp-work --wraps omp");
-		expect(content).toContain("command omp --profile=work $argv");
+		const content = files.get("/Users/me/.config/fish/conf.d/rtx-profiles.fish") ?? "";
+		expect(content).toContain("function omp-work --wraps rtx");
+		expect(content).toContain("command rtx --profile=work $argv");
 	});
 
 	it("installs the fish alias under XDG_CONFIG_HOME when set", async () => {
@@ -121,8 +121,8 @@ describe("profile alias installer", () => {
 			},
 		});
 
-		expect(result.configPath).toBe("/home/me/.dotfiles/config/fish/conf.d/omp-profiles.fish");
-		expect(files.get(result.configPath)).toContain("function omp-work --wraps omp");
+		expect(result.configPath).toBe("/home/me/.dotfiles/config/fish/conf.d/rtx-profiles.fish");
+		expect(files.get(result.configPath)).toContain("function omp-work --wraps rtx");
 	});
 
 	it("writes a PowerShell function because aliases cannot carry arguments", async () => {
@@ -142,7 +142,7 @@ describe("profile alias installer", () => {
 
 		const content = files.get("C:\\Users\\me/Documents/PowerShell/Microsoft.PowerShell_profile.ps1") ?? "";
 		expect(content).toContain("function omp-work");
-		expect(content).toContain("& omp --profile=work @args");
+		expect(content).toContain("& rtx --profile=work @args");
 	});
 
 	it("detects pwsh from PSModulePath when SHELL is unset on Windows", async () => {
@@ -165,7 +165,7 @@ describe("profile alias installer", () => {
 
 		expect(result.shell).toBe("pwsh");
 		expect(result.configPath).toBe("C:\\Users\\me/Documents/PowerShell/Microsoft.PowerShell_profile.ps1");
-		expect(files.get(result.configPath)).toContain("& omp --profile=work @args");
+		expect(files.get(result.configPath)).toContain("& rtx --profile=work @args");
 	});
 
 	it("selects Windows PowerShell when only WindowsPowerShell modules are present", async () => {
@@ -215,6 +215,39 @@ describe("profile alias installer", () => {
 				"/home/me/.zshrc",
 				[
 					"before",
+					"# >>> rtx profile alias: omp-work >>>",
+					"alias omp-work='command rtx --profile=old'",
+					"# <<< rtx profile alias: omp-work <<<",
+					"after",
+				].join("\n"),
+			],
+		]);
+
+		await installProfileAlias({
+			profile: "work",
+			aliasName: "omp-work",
+			shellPath: "/bin/zsh",
+			platform: "darwin",
+			homeDir: "/home/me",
+			readFile: async filePath => files.get(filePath) ?? "",
+			writeFile: async (filePath, content) => {
+				files.set(filePath, content);
+			},
+		});
+
+		const content = files.get("/home/me/.zshrc") ?? "";
+		expect(content).toContain("before");
+		expect(content).toContain("after");
+		expect(content).toContain('command rtx --profile=work "$@"');
+		expect(content).not.toContain("--profile=old");
+	});
+
+	it("replaces a legacy omp managed block for the same alias", async () => {
+		const files = new Map<string, string>([
+			[
+				"/home/me/.zshrc",
+				[
+					"before",
 					"# >>> omp profile alias: omp-work >>>",
 					"alias omp-work='command omp --profile=old'",
 					"# <<< omp profile alias: omp-work <<<",
@@ -238,8 +271,9 @@ describe("profile alias installer", () => {
 		const content = files.get("/home/me/.zshrc") ?? "";
 		expect(content).toContain("before");
 		expect(content).toContain("after");
-		expect(content).toContain('command omp --profile=work "$@"');
-		expect(content).not.toContain("--profile=old");
+		expect(content).toContain("# >>> rtx profile alias: omp-work >>>");
+		expect(content).toContain('command rtx --profile=work "$@"');
+		expect(content).not.toContain("omp --profile=old");
 	});
 
 	it("refuses to rewrite a malformed managed block missing its end marker", async () => {
@@ -247,7 +281,7 @@ describe("profile alias installer", () => {
 		// was interrupted or hand-edited. Appending a fresh block would let the
 		// *next* install splice from the stale start through the new end, deleting
 		// the user config in between. Refuse and preserve the file untouched.
-		const original = ["# >>> omp profile alias: omp-work >>>", "omp-work() {", "export SECRET=keepme"].join("\n");
+		const original = ["# >>> rtx profile alias: omp-work >>>", "omp-work() {", "export SECRET=keepme"].join("\n");
 		const files = new Map<string, string>([["/home/me/.zshrc", original]]);
 		let wrote = false;
 
@@ -270,8 +304,8 @@ describe("profile alias installer", () => {
 		expect(files.get("/home/me/.zshrc")).toBe(original);
 	});
 
-	it("refuses to shadow the base omp command case-insensitively", async () => {
-		for (const aliasName of ["omp", "OMP"]) {
+	it("refuses to shadow the base rtx command case-insensitively", async () => {
+		for (const aliasName of ["rtx", "RTX"]) {
 			await expect(
 				installProfileAlias({
 					profile: "work",
@@ -342,7 +376,7 @@ describe("profile alias installer", () => {
 					files.set(filePath, content);
 				},
 			}),
-		).rejects.toThrow("Invalid OMP profile");
+		).rejects.toThrow("Invalid rtx profile");
 		expect(files.size).toBe(0);
 	});
 });
