@@ -92,6 +92,33 @@ jobs:
             bun run build
           fi
 
+      # `rtx --version` reads packages/utils/package.json's `version` (via
+      # pi-utils dirs.ts). Stamp it with the fork's release tag so the version
+      # is the comparable semver core that `rtx update` relies on: it fetches
+      # this fork's GitHub releases (v0.1.x) and only updates when the release
+      # sorts newer than the running version. Upstream's baseline (16.0.6) must
+      # NOT be the core or every fork release looks older and the updater is a
+      # no-op. On a `v*` tag we stamp the tag (e.g. 0.1.2); manual runs get a
+      # `0.0.0-dev.<sha>` prerelease that always sorts below real releases. This
+      # is an ephemeral, runner-only edit (like embed:native) — nothing committed.
+      - name: Stamp fork version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ver="${GITHUB_REF_NAME#v}"
+          else
+            ver="0.0.0-dev.${GITHUB_SHA:0:7}"
+          fi
+          bun -e '
+            const fs = require("node:fs");
+            const ver = process.argv[1];
+            for (const p of ["packages/utils/package.json", "packages/coding-agent/package.json"]) {
+              const j = JSON.parse(fs.readFileSync(p, "utf8"));
+              j.version = ver;
+              fs.writeFileSync(p, `${JSON.stringify(j, null, "\t")}\n`);
+            }
+          ' "$ver"
+          echo "Stamped version: $ver"
+
       - name: Compile self-contained binary
         working-directory: packages/coding-agent
         run: bun run build
