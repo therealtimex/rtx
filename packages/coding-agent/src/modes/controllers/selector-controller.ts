@@ -27,7 +27,7 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import type { ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -314,15 +314,36 @@ export class SelectorController {
 					}
 				}
 				break;
-			case "hideThinking":
+			case "hideThinkingBlock":
 				this.ctx.hideThinkingBlock = value as boolean;
-				this.ctx.session.agent.hideThinkingSummary = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof AssistantMessageComponent) {
 						child.setHideThinkingBlock(value as boolean);
-						child.invalidate();
 					}
 				}
+				// Full clear + replay so blocks frozen in committed scrollback on
+				// ED3-risk terminals retire their stale snapshots too (see
+				// InputController.toggleThinkingBlockVisibility).
+				this.ctx.ui.resetDisplay();
+				break;
+			case "proseOnlyThinking":
+				this.ctx.proseOnlyThinking = value as boolean;
+				for (const child of this.ctx.chatContainer.children) {
+					if (child instanceof AssistantMessageComponent) {
+						child.setProseOnlyThinking(value as boolean);
+					}
+				}
+				this.ctx.ui.resetDisplay();
+				break;
+			case "omitThinking":
+				this.ctx.session.agent.hideThinkingSummary = value as boolean;
+				break;
+			case "display.cacheMissMarker":
+				// Rebuild re-runs the usage-based detection under the new setting so
+				// markers appear/disappear; full reset retires any already committed
+				// to native scrollback (mirrors hideThinking).
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
 				break;
 			case "tui.tight":
 				setTuiTight(value as boolean);
@@ -473,7 +494,10 @@ export class SelectorController {
 							}
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
-							this.ctx.showStatus(`Temporary model: ${selector ?? model.id}`);
+							const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
+							this.ctx.showStatus(
+								`Session-only model: ${selector ?? model.id}. Use ${roleSelectorHint} or /model for roles.`,
+							);
 							done();
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
@@ -807,14 +831,9 @@ export class SelectorController {
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
-		// Current folder has no sessions: preload the global list so the picker
-		// can open straight into all-projects scope instead of dead-ending.
-		let allSessions: SessionInfo[] | undefined;
-		let startInAllScope = false;
-		if (sessions.length === 0) {
-			allSessions = await SessionManager.listAll();
-			startInAllScope = allSessions.length > 0;
-		}
+		// Always open in current-folder scope; the empty-state hint in SessionList
+		// invites the user to Tab into all-projects rather than silently surfacing
+		// every project's history when the cwd has nothing to resume. See #3099.
 		const historyStorage = this.ctx.historyStorage;
 		const historyMatcher = historyStorage ? (query: string) => historyStorage.matchingSessionIds(query) : undefined;
 		this.showSelector(done => {
@@ -848,8 +867,6 @@ export class SelectorController {
 					},
 					historyMatcher,
 					loadAllSessions: () => SessionManager.listAll(),
-					allSessions,
-					startInAllScope,
 					getTerminalRows: () => this.ctx.ui.terminal.rows,
 				},
 			);
@@ -1151,7 +1168,7 @@ export class SelectorController {
 	async showResetUsageSelector(): Promise<void> {
 		const session = this.ctx.session;
 		this.ctx.showStatus("Checking saved rate-limit resets…", { dim: true });
-		let statuses: Awaited<ReturnType<typeof session.listResetCredits>>;
+		let statuses: ResetCreditAccountStatus[];
 		try {
 			statuses = await session.listResetCredits();
 		} catch (error) {
@@ -1254,6 +1271,7 @@ export class SelectorController {
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
 			hideThinkingBlock: () => this.ctx.hideThinkingBlock,
+			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
 			focusAgent: id => this.ctx.focusAgentSession(id),
 			sessionFile: this.ctx.sessionManager.getSessionFile() ?? null,
 		});

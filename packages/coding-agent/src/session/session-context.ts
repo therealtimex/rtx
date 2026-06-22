@@ -7,6 +7,8 @@ import { type CompactionEntry, EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } 
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel?: string;
+	/** Configured thinking selector (`"auto"` or a concrete level) from the latest change. */
+	configuredThinkingLevel?: string;
 	serviceTier?: ServiceTier;
 	/** Model roles: { default: "provider/modelId", small: "provider/modelId", ... } */
 	models: Record<string, string>;
@@ -20,6 +22,13 @@ export interface SessionContext {
 	mode: string;
 	/** Mode-specific data from the last mode_change entry */
 	modeData?: Record<string, unknown>;
+	/**
+	 * Array parallel to messages, indicating which assistant turns should
+	 * have their prompt-cache misses suppressed/explained (because a model,
+	 * compaction, or plan-mode transition directly preceded them).
+	 * Only populated in transcript mode.
+	 */
+	cacheMissExplainedAt?: boolean[];
 }
 
 /** Lists session model strings to try when restoring, in fallback order. */
@@ -127,6 +136,7 @@ export function buildSessionContext(
 
 	// Extract settings and find compaction
 	let thinkingLevel: string | undefined = "off";
+	let configuredThinkingLevel: string | undefined;
 	let serviceTier: ServiceTier | undefined;
 	const models: Record<string, string> = {};
 	let compaction: CompactionEntry | null = null;
@@ -147,6 +157,7 @@ export function buildSessionContext(
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
+			configuredThinkingLevel = entry.configured ?? entry.thinkingLevel ?? undefined;
 		} else if (entry.type === "model_change") {
 			// New format: { model: "provider/id", role?: string }
 			if (entry.model) {
@@ -191,12 +202,45 @@ export function buildSessionContext(
 	// 2. Emit kept messages (from firstKeptEntryId up to compaction)
 	// 3. Emit messages after compaction
 	const messages: AgentMessage[] = [];
+	const cacheMissExplainedAt: boolean[] = [];
+	let pendingReset = false;
+	let currentMode = "none";
+	let lastAssistantModel: string | undefined;
+
+	const handleEntryResetTracking = (entry: SessionEntry) => {
+		if (entry.type === "compaction") {
+			pendingReset = true;
+		} else if (entry.type === "model_change") {
+			pendingReset = true;
+		} else if (entry.type === "mode_change") {
+			const isPlanTransition = (entry.mode === "plan") !== (currentMode === "plan");
+			if (isPlanTransition) {
+				pendingReset = true;
+			}
+			currentMode = entry.mode;
+		}
+	};
+
+	const pushMessage = (msg: AgentMessage) => {
+		messages.push(msg);
+		if (!options?.transcript) return;
+		if (msg.role === "assistant") {
+			const currentModel = `${msg.provider}/${msg.model}`;
+			const modelChanged = lastAssistantModel !== undefined && lastAssistantModel !== currentModel;
+			lastAssistantModel = currentModel;
+			cacheMissExplainedAt.push(pendingReset || modelChanged);
+			pendingReset = false;
+		} else {
+			cacheMissExplainedAt.push(false);
+		}
+	};
 
 	const appendMessage = (entry: SessionEntry) => {
+		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
-			messages.push(entry.message);
+			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
-			messages.push(
+			pushMessage(
 				createCustomMessage(
 					entry.customType,
 					entry.content,
@@ -207,7 +251,7 @@ export function buildSessionContext(
 				),
 			);
 		} else if (entry.type === "branch_summary" && entry.summary) {
-			messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+			pushMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}
 	};
 
@@ -217,16 +261,18 @@ export function buildSessionContext(
 		// TUI) at the point it fired, with any snapcompact frames re-attached so
 		// the component can report them.
 		for (const entry of path) {
+			handleEntryResetTracking(entry);
 			if (entry.type === "compaction") {
 				const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
-				messages.push(
+				pushMessage(
 					createCompactionSummaryMessage(
 						entry.summary,
 						entry.tokensBefore,
 						entry.timestamp,
 						entry.shortSummary,
 						undefined,
-						snapcompactArchive ? snapcompact.images(snapcompactArchive) : undefined,
+						undefined,
+						snapcompactArchive ? snapcompact.historyBlocks(snapcompactArchive) : undefined,
 					),
 				);
 			} else {
@@ -251,14 +297,15 @@ export function buildSessionContext(
 		// Emit summary first; re-attach any archived snapcompact frames so the
 		// model can keep reading the archived history after every context rebuild.
 		const snapcompactArchive = snapcompact.getPreservedArchive(compaction.preserveData);
-		messages.push(
+		pushMessage(
 			createCompactionSummaryMessage(
 				compaction.summary,
 				compaction.tokensBefore,
 				compaction.timestamp,
 				compaction.shortSummary,
 				providerPayload,
-				snapcompactArchive ? snapcompact.images(snapcompactArchive) : undefined,
+				undefined,
+				snapcompactArchive ? snapcompact.historyBlocks(snapcompactArchive) : undefined,
 			),
 		);
 
@@ -333,6 +380,9 @@ export function buildSessionContext(
 			);
 		if (normalized.length === 0) {
 			messages.splice(i, 1);
+			if (options?.transcript) {
+				cacheMissExplainedAt.splice(i, 1);
+			}
 		} else {
 			messages[i] = { ...message, content: normalized };
 		}
@@ -340,7 +390,9 @@ export function buildSessionContext(
 
 	return {
 		messages,
+		cacheMissExplainedAt: options?.transcript ? cacheMissExplainedAt : undefined,
 		thinkingLevel,
+		configuredThinkingLevel,
 		serviceTier,
 		models,
 		injectedTtsrRules,

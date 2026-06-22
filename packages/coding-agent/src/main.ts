@@ -11,6 +11,7 @@ import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	directoryExists,
 	getLogPath,
 	getProjectDir,
 	logger,
@@ -73,7 +74,7 @@ import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
-import { AUTO_THINKING } from "./thinking";
+import { AUTO_THINKING, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
 import {
 	getChangelogPath,
@@ -130,9 +131,12 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"memory.backend",
 	"memories.enabled",
 	// Advisor is interactive-session assistance. Protocol hosts opt in explicitly
-	// instead of inheriting a user's globally-enabled local preference.
+	// instead of inheriting a user's globally-enabled local preference, and when
+	// they do opt in they get the default tuning rather than the user's local tuning.
 	"advisor.enabled",
 	"advisor.subagents",
+	"advisor.syncBacklog",
+	"advisor.immuneTurns",
 ];
 
 const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
@@ -142,8 +146,16 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"bash.autoBackground.thresholdMs",
 ];
 
+// Protocol-mode hosts opt into a small set of paths whose host-default we
+// re-apply at startup so embedders inherit OMP's neutral defaults instead of
+// the local user's globally-persisted preferences for interactive use. The
+// guard preserves any explicit configuration — caller `Settings.isolated`
+// overrides, project `.claude/settings.yml`, `--config` overlays, or global
+// `config.yml` — so the host default only kicks in when nothing is set. Without
+// it the override clobbers every caller/host choice (#2598, #3207).
 function applyDefaultSettingOverrides(settingPaths: SettingPath[], targetSettings: Settings): void {
 	for (const settingPath of settingPaths) {
+		if (targetSettings.isConfigured(settingPath)) continue;
 		targetSettings.override(settingPath, getDefault(settingPath));
 	}
 }
@@ -569,7 +581,11 @@ async function moveMissingCwdSessionIfNeeded(
 		return { status: "declined" };
 	}
 
-	const manager = await SessionManager.open(session.path, sessionDir);
+	// Open anchored at the (now-missing) recorded cwd: `open` otherwise falls back
+	// to the launch cwd, which would make the `moveTo` below a no-op whenever the
+	// move target equals the current project dir. moveTo never chdirs, so the
+	// stale cwd is only a relocation source, not a directory we enter.
+	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
 	await manager.moveTo(cwd, sessionDir);
 	return { status: "moved", manager };
 }
@@ -745,6 +761,20 @@ function discoverAppendSystemPromptFile(): string | undefined {
 	return undefined;
 }
 
+/** Apply resolved CLI/discovered prompt files without bypassing system prompt templates. */
+export function applyResolvedSystemPromptInputs(
+	options: CreateAgentSessionOptions,
+	resolvedSystemPrompt: string | undefined,
+	resolvedAppendPrompt: string | undefined,
+): void {
+	if (resolvedSystemPrompt) {
+		options.customSystemPrompt = resolvedSystemPrompt;
+	}
+	if (resolvedAppendPrompt) {
+		options.appendSystemPrompt = resolvedAppendPrompt;
+	}
+}
+
 async function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
@@ -854,7 +884,7 @@ async function buildSessionOptions(
 	if (scopedModels.length > 0) {
 		// `auto` is a session-level concept only; per-scoped-model (Ctrl+P) thinking
 		// overrides stay concrete, so coerce the auto default to "unset" here.
-		const defaultThinkingLevelSetting = activeSettings.get("defaultThinkingLevel");
+		const defaultThinkingLevelSetting = parseConfiguredThinkingLevel(activeSettings.get("defaultThinkingLevel"));
 		const defaultThinkingLevel =
 			defaultThinkingLevelSetting === AUTO_THINKING ? undefined : defaultThinkingLevelSetting;
 		options.scopedModels = scopedModels.map(scopedModel => ({
@@ -869,13 +899,7 @@ async function buildSessionOptions(
 	// (handled by caller before createAgentSession)
 
 	// System prompt
-	if (resolvedSystemPrompt && resolvedAppendPrompt) {
-		options.systemPrompt = defaultPrompt => [resolvedSystemPrompt, resolvedAppendPrompt, ...defaultPrompt.slice(1)];
-	} else if (resolvedSystemPrompt) {
-		options.systemPrompt = defaultPrompt => [resolvedSystemPrompt, ...defaultPrompt.slice(1)];
-	} else if (resolvedAppendPrompt) {
-		options.systemPrompt = defaultPrompt => [...defaultPrompt, resolvedAppendPrompt];
-	}
+	applyResolvedSystemPromptInputs(options, resolvedSystemPrompt, resolvedAppendPrompt);
 
 	// Tools
 	if (parsed.noTools) {
@@ -1036,6 +1060,13 @@ export async function runRootCommand(
 		});
 	}
 
+	// --print-thoughts (single-shot print mode) must surface reasoning, so un-hide
+	// thinking before the session is built — otherwise a passive omitThinking
+	// setting makes the provider omit summaries and the flag prints nothing. An
+	// explicit --hide-thinking block display option still wins for output display.
+	if (parsedArgs.printThoughts && !isProtocolMode && !isInteractive) {
+		settingsInstance.override("omitThinking", false);
+	}
 	// Apply --hide-thinking CLI flag (ephemeral, not persisted)
 	if (parsedArgs.hideThinking) {
 		settingsInstance.override("hideThinkingBlock", true);
@@ -1104,21 +1135,21 @@ export async function runRootCommand(
 	if (parsedArgs.resume === true && !parsedArgs.fork) {
 		const folderSessions = await logger.time("SessionManager.list", SessionManager.list, cwd, parsedArgs.sessionDir);
 		let preloadedAllSessions: SessionInfo[] | undefined;
-		let startInAllScope = false;
 		if (folderSessions.length === 0) {
-			// Nothing in the current folder — fall back to a global scan so the
-			// picker can still open in all-projects scope instead of dead-ending.
+			// Probe globally so we can exit fast when the user has no sessions at
+			// all, but never auto-switch the picker into all-projects scope — that
+			// silently surfaced other projects' history when the cwd was empty
+			// (issue #3099). The preloaded list also makes the user's Tab switch
+			// instant on the way in.
 			preloadedAllSessions = await logger.time("SessionManager.listAll", SessionManager.listAll);
 			if (preloadedAllSessions.length === 0) {
 				writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
 				return;
 			}
-			startInAllScope = true;
 		}
 		pauseStartupWatchdog();
 		const selected = await logger.time("selectSession", selectSession, folderSessions, {
 			allSessions: preloadedAllSessions,
-			startInAllScope,
 		});
 		resumeStartupWatchdog();
 		if (!selected) {
@@ -1128,7 +1159,14 @@ export async function runRootCommand(
 		// Resuming a session from another project: switch the process into that
 		// project's directory and refresh cwd-derived caches before the session is
 		// built, so settings discovery, plugins, and capabilities all scope to it.
-		if (selected.cwd && normalizePathForComparison(selected.cwd) !== normalizePathForComparison(getProjectDir())) {
+		// Skip the chdir when the recorded project directory is gone: `setProjectDir`
+		// would throw on the missing path. `SessionManager.open` then falls back to
+		// the launch cwd, so the resumed session simply stays where the user is.
+		if (
+			selected.cwd &&
+			normalizePathForComparison(selected.cwd) !== normalizePathForComparison(getProjectDir()) &&
+			(await directoryExists(selected.cwd))
+		) {
 			// Let the original (launch-cwd) plugin-root preload settle first so its
 			// late resolution can't clobber the re-warm we trigger below.
 			await pluginPreloadPromise.catch(() => {});
@@ -1370,6 +1408,7 @@ export async function runRootCommand(
 				messages: initialArgs.messages,
 				initialMessage,
 				initialImages,
+				printThoughts: initialArgs.printThoughts,
 			});
 			if ($env.PI_TIMING) {
 				logger.printTimings();

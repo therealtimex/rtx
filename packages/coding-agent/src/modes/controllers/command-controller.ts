@@ -38,6 +38,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
+import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
@@ -84,15 +85,30 @@ export class CommandController {
 		}
 	}
 
-	handleDumpCommand() {
+	async handleDumpCommand(): Promise<void> {
 		try {
 			const formatted = this.ctx.session.formatSessionAsText();
 			if (!formatted) {
 				this.ctx.showError("No messages to dump yet.");
 				return;
 			}
-			copyToClipboard(formatted);
-			this.ctx.showStatus("Session copied to clipboard");
+			// Build the LLM request JSON sidecar first so its path (and a
+			// raw-context warning) can be appended to the copied transcript.
+			let sidecarPath: string | undefined;
+			let sidecarError: string | undefined;
+			try {
+				sidecarPath = await this.ctx.session.dumpLlmRequestToTmpDir();
+			} catch (error: unknown) {
+				sidecarError = error instanceof Error ? error.message : "Unknown error";
+			}
+			const doc = sidecarPath
+				? `${formatted}\n\n---\nLLM request JSON: ${sidecarPath}\nThis file persists on disk and may contain raw context/secrets — treat accordingly.`
+				: formatted;
+			await copyToClipboard(doc);
+			const statusParts = ["Session copied to clipboard"];
+			if (sidecarPath) statusParts.push(`LLM request JSON: ${sidecarPath}`);
+			if (sidecarError) statusParts.push(`LLM request JSON unavailable: ${sidecarError}`);
+			this.ctx.showStatus(statusParts.join("\n"));
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
@@ -1034,6 +1050,7 @@ export class CommandController {
 
 	async handleCompactCommand(
 		customInstructions?: string,
+		mode?: CompactMode,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
 	): Promise<CompactionOutcome> {
 		const entries = this.ctx.sessionManager.getEntries();
@@ -1044,7 +1061,7 @@ export class CommandController {
 			return "ok";
 		}
 
-		return this.executeCompaction(customInstructions, false, beforeFlush);
+		return this.executeCompaction(customInstructions, false, beforeFlush, mode);
 	}
 
 	/**
@@ -1090,6 +1107,7 @@ export class CommandController {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto = false,
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
+		mode?: CompactMode,
 	): Promise<CompactionOutcome> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
@@ -1111,9 +1129,16 @@ export class CommandController {
 		let outcome: CompactionOutcome = "ok";
 		try {
 			const instructions = typeof customInstructionsOrOptions === "string" ? customInstructionsOrOptions : undefined;
-			const options =
+			const baseOptions =
 				customInstructionsOrOptions && typeof customInstructionsOrOptions === "object"
 					? customInstructionsOrOptions
+					: undefined;
+			// The slash path passes `mode` positionally; the extension path carries
+			// it inside the options object. Either source wins over no mode.
+			const effectiveMode = mode ?? baseOptions?.mode;
+			const options =
+				baseOptions || effectiveMode
+					? { ...baseOptions, ...(effectiveMode ? { mode: effectiveMode } : {}) }
 					: undefined;
 			await this.ctx.session.compact(instructions, options);
 
