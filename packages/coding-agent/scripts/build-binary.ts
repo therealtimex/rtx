@@ -52,6 +52,10 @@ async function main(): Promise<void> {
 					"--no-compile-autoload-dotenv",
 					"--no-compile-autoload-tsconfig",
 					"--no-compile-autoload-package-json",
+					// Minify identifiers to match upstream's release build
+					// (ci-release-build-binaries.ts); shrinks the embedded JS bundle
+					// ~46 MB. --keep-names below preserves fn/class names for traces.
+					"--minify-identifiers",
 					"--keep-names",
 					"--define",
 					'process.env.PI_COMPILED="true"',
