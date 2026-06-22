@@ -4,8 +4,9 @@
 #   scripts/install.ps1 -> rtx-windows-x64.exe
 #
 # Stages per job (the flow proven to build locally in R1):
-#   1. Build the Rust napi native(s) — x64 needs BOTH tiers (modern + baseline);
-#      arm64 is a single build.
+#   1. Build the Rust napi native(s) — only linux-x64 ships BOTH tiers (modern +
+#      baseline); darwin-x64/windows-x64/arm64 are a single baseline build, which
+#      matches upstream (oh-my-pi ci.yml) and keeps the binary ~113 MB smaller.
 #   2. `bun run build` (build-binary.ts) embeds native + Bun runtime -> dist/rtx[.exe].
 #   3. Rename to the asset name, upload as an artifact, and (on a `v*` tag)
 #      attach to the GitHub release.
@@ -38,9 +39,9 @@ jobs:
           - os: macos-14 # Apple Silicon
             asset: rtx-darwin-arm64
             dual_tier: false
-          - os: macos-13 # Intel
+          - os: macos-15-intel # Intel
             asset: rtx-darwin-x64
-            dual_tier: true
+            dual_tier: false
           - os: ubuntu-latest
             asset: rtx-linux-x64
             dual_tier: true
@@ -51,7 +52,7 @@ jobs:
             linux: true
           - os: windows-latest
             asset: rtx-windows-x64.exe
-            dual_tier: true
+            dual_tier: false
             windows: true
 
     steps:
@@ -78,8 +79,9 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      # x64 builds both ISA tiers so the runtime loader always finds its match
-      # (the modern/baseline trap). arm64 has no tier split.
+      # dual_tier builds both ISA tiers so the runtime loader always finds its
+      # match (the modern/baseline trap); only linux-x64 sets it. Single-tier
+      # platforms build baseline, which the loader falls back to everywhere.
       - name: Build native addon(s)
         working-directory: packages/natives
         run: |
