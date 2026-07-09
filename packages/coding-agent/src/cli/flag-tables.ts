@@ -30,7 +30,7 @@
  * real implementations at the dispatch site.
  */
 
-import type { Effort } from "@oh-my-pi/pi-ai";
+import type { ConfiguredThinkingLevel } from "../thinking";
 import type { Args } from "./args";
 
 /**
@@ -44,8 +44,9 @@ import type { Args } from "./args";
  */
 export interface ParseDeps {
 	logger: { warn: (message: string, meta?: Record<string, unknown>) => void };
-	parseEffort: (value: string | null | undefined) => Effort | undefined;
+	parseThinking: (value: string | null | undefined) => ConfiguredThinkingLevel | undefined;
 	builtinToolNames: readonly string[];
+	normalizeToolNames: (values: Iterable<string>) => string[];
 	thinkingEfforts: readonly string[];
 }
 
@@ -147,10 +148,12 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.models = value.split(",").map(s => s.trim());
 	},
 	"--tools": (result, value, deps) => {
-		const names = value
-			.split(",")
-			.map(s => s.trim().toLowerCase())
-			.filter(Boolean);
+		const names = deps.normalizeToolNames(
+			value
+				.split(",")
+				.map(s => s.trim())
+				.filter(Boolean),
+		);
 		const valid: string[] = [];
 		for (const name of names) {
 			if (deps.builtinToolNames.includes(name)) {
@@ -165,7 +168,7 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.tools = valid;
 	},
 	"--thinking": (result, value, deps) => {
-		const thinking = deps.parseEffort(value);
+		const thinking = deps.parseThinking(value);
 		if (thinking !== undefined) {
 			result.thinking = thinking;
 		} else {

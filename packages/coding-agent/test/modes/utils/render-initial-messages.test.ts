@@ -1,10 +1,9 @@
 /**
- * Contract: renderInitialMessages renders the DISPLAY TRANSCRIPT, not the LLM
- * context. The transcript comes from `session.buildTranscriptSessionContext()`
- * (full history, compactions inline); `sessionManager.buildSessionContext()`
- * — the LLM-context builder — must not be consulted for display. Feeding the
- * compacted LLM context to the chat is exactly the old "session starts over
- * after compaction" bug.
+ * Contract: renderInitialMessages renders the collapsed live DISPLAY TRANSCRIPT,
+ * not the LLM context. The transcript comes from
+ * `session.buildTranscriptSessionContext({ collapseCompactedHistory: true })`;
+ * `sessionManager.buildSessionContext()` — the LLM-context builder — must not be
+ * consulted for display.
  *
  * Also guards the cold-launch terminal cleanup: `omp` / `omp -c` leave the
  * previous run's transcript in native scrollback because the TUI's initial
@@ -15,6 +14,7 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
+import { kStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -52,7 +52,7 @@ function makeEmptyContext(): SessionContext {
 /** Build a minimal InteractiveModeContext mock, returning spies for assertions. */
 function makeCtx(): {
 	ctx: InteractiveModeContext;
-	transcriptSpy: Mock<() => SessionContext>;
+	transcriptSpy: Mock<(options?: { collapseCompactedHistory?: boolean }) => SessionContext>;
 	llmContextSpy: Mock<() => SessionContext>;
 	renderSessionContextSpy: Mock<(...args: unknown[]) => void>;
 } {
@@ -62,7 +62,7 @@ function makeCtx(): {
 
 	const ctx = {
 		chatContainer: { clear: vi.fn(), addChild: vi.fn() },
-		pendingMessagesContainer: { clear: vi.fn() },
+		pendingMessagesContainer: { clear: vi.fn(), disposeChildren: vi.fn() },
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
 		session: { buildTranscriptSessionContext: transcriptSpy },
@@ -182,14 +182,14 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 }
 
 describe("UiHelpers.renderInitialMessages — transcript source", () => {
-	it("renders the display transcript, never the LLM context", () => {
+	it("renders the collapsed live display transcript, never the LLM context", () => {
 		const { ctx, transcriptSpy, llmContextSpy, renderSessionContextSpy } = makeCtx();
 		const transcript = makeEmptyContext();
 		transcriptSpy.mockReturnValue(transcript);
 
 		new UiHelpers(ctx).renderInitialMessages();
 
-		expect(transcriptSpy).toHaveBeenCalledTimes(1);
+		expect(transcriptSpy).toHaveBeenCalledWith({ collapseCompactedHistory: true });
 		expect(llmContextSpy).not.toHaveBeenCalled();
 		expect(renderSessionContextSpy).toHaveBeenCalledWith(transcript, {
 			updateFooter: true,
@@ -242,7 +242,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
 		setTerminalImageProtocol(ImageProtocol.Sixel);
 		const transcript = transcriptWith([
-			assistantToolCall("eval-image", "eval", { cells: [{ language: "py", code: "display(image)" }] }),
+			assistantToolCall("eval-image", "eval", { language: "py", code: "display(image)" }),
 			{
 				role: "toolResult",
 				toolCallId: "eval-image",
@@ -279,9 +279,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 			isError: false,
 			timestamp: 2,
 		});
-		session.appendMessage(
-			assistantToolCall("eval-reopened", "eval", { cells: [{ language: "py", code: "display(image)" }] }),
-		);
+		session.appendMessage(assistantToolCall("eval-reopened", "eval", { language: "py", code: "display(image)" }));
 		session.appendMessage({
 			role: "toolResult",
 			toolCallId: "eval-reopened",
@@ -306,5 +304,87 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		expect(countImageComponents(chatContainer)).toBe(2);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read reopened.png");
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
+	});
+});
+
+describe("UiHelpers.renderSessionContext — error-stop tool calls", () => {
+	it("keeps the synthetic assistant error result instead of replaying a later tool result", async () => {
+		await Settings.init({ inMemory: true });
+		const transcript = transcriptWith([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "error-tool",
+						name: "eval",
+						arguments: { language: "py", code: "raise RuntimeError('boom')" },
+					},
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				usage: emptyUsage,
+				stopReason: "error",
+				errorMessage: "synthetic assistant stop error",
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "error-tool",
+				toolName: "eval",
+				content: [{ type: "text", text: "late tool result must not replace the assistant stop error" }],
+				isError: false,
+				timestamp: 2,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		new UiHelpers(ctx).renderInitialMessages();
+
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain("synthetic assistant stop error");
+		expect(rendered).not.toContain("late tool result must not replace the assistant stop error");
+	});
+});
+
+describe("UiHelpers.renderSessionContext — mid-stream tool call rebuild", () => {
+	it("decodes streamed write content from partialJson, not the provider's stale parsed arguments", async () => {
+		// A transcript rebuild (theme change, settings edit, focus replay) can land
+		// while a write's args still stream. The provider re-parses `arguments`
+		// only every STREAMING_JSON_PARSE_MIN_GROWTH bytes, so the parsed snapshot
+		// lags the raw buffer. The rebuilt preview must decode from the buffer —
+		// exactly like the live reveal path — or the write body freezes at the
+		// last throttled parse until more bytes arrive.
+		await Settings.init({ inMemory: true });
+		const staleContent = "line one of the streamed write";
+		const grownBuffer = `{"path":"/tmp/mid.ts","content":"${staleContent}\\nGROWN_TAIL_SENTINEL`;
+		const transcript = transcriptWith([
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "write-mid",
+						name: "write",
+						// Provider-parsed snapshot from BEFORE the buffer grew.
+						arguments: { path: "/tmp/mid.ts", content: staleContent },
+						[kStreamingPartialJson]: grownBuffer,
+					},
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				usage: emptyUsage,
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		new UiHelpers(ctx).renderInitialMessages();
+
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain("GROWN_TAIL_SENTINEL");
 	});
 });

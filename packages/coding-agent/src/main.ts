@@ -67,6 +67,7 @@ import {
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
+import { describePendingToolCalls } from "./session/exit-diagnostics";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
@@ -74,7 +75,7 @@ import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
-import { AUTO_THINKING, parseConfiguredThinkingLevel } from "./thinking";
+import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
 import {
 	getChangelogPath,
@@ -137,6 +138,7 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"advisor.subagents",
 	"advisor.syncBacklog",
 	"advisor.immuneTurns",
+	"tier.advisor",
 ];
 
 const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
@@ -357,6 +359,13 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
+		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
+		// host can open `session/new` for any client-supplied workspace, so
+		// re-discover `TITLE_SYSTEM.md` against THIS session's `cwd` to keep the
+		// replan-driven title refresh consistent with the target project's
+		// policy (PR #3736 follow-up).
+		const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
+		const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
 		const { session: nextSession } = await args.createSession({
 			...args.baseOptions,
 			cwd,
@@ -367,6 +376,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			agentId,
 			hasUI: false,
 			enableMCP: false,
+			titleSystemPrompt,
 		});
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
@@ -392,7 +402,6 @@ async function runInteractiveMode(
 	eventBus?: EventBus,
 	initialMessage?: string,
 	initialImages?: ImageContent[],
-	titleSystemPrompt?: string,
 	joinLink?: string,
 ): Promise<void> {
 	const mode = new InteractiveMode(
@@ -403,7 +412,6 @@ async function runInteractiveMode(
 		lspServers,
 		mcpManager,
 		eventBus,
-		titleSystemPrompt,
 	);
 
 	// Cold-launch gate: the full setup wizard (every scene + the overlay and
@@ -781,7 +789,7 @@ async function buildSessionOptions(
 	sessionManager: SessionManager | undefined,
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
-): Promise<{ options: CreateAgentSessionOptions; titleSystemPrompt?: string }> {
+): Promise<CreateAgentSessionOptions> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
@@ -792,11 +800,13 @@ async function buildSessionOptions(
 
 	// Auto-discover SYSTEM.md if no CLI system prompt provided
 	const systemPromptSource = parsed.systemPrompt ?? discoverSystemPromptFile();
-	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
 	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
-	const resolvedAppendPrompt = await resolvePromptInput(appendPromptSource, "append system prompt");
 	const titleSystemPromptSource = discoverTitleSystemPromptFile();
-	const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
+	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt] = await Promise.all([
+		resolvePromptInput(systemPromptSource, "system prompt"),
+		resolvePromptInput(appendPromptSource, "append system prompt"),
+		resolvePromptInput(titleSystemPromptSource, "title system prompt"),
+	]);
 
 	if (sessionManager) {
 		options.sessionManager = sessionManager;
@@ -846,7 +856,6 @@ async function buildSessionOptions(
 				{
 					settings: activeSettings,
 					matchPreferences: modelMatchPreferences,
-					modelRegistry,
 				},
 			);
 			const rememberedResolvedModel = rememberedSpec.model;
@@ -884,9 +893,9 @@ async function buildSessionOptions(
 	if (scopedModels.length > 0) {
 		// `auto` is a session-level concept only; per-scoped-model (Ctrl+P) thinking
 		// overrides stay concrete, so coerce the auto default to "unset" here.
-		const defaultThinkingLevelSetting = parseConfiguredThinkingLevel(activeSettings.get("defaultThinkingLevel"));
-		const defaultThinkingLevel =
-			defaultThinkingLevelSetting === AUTO_THINKING ? undefined : defaultThinkingLevelSetting;
+		const defaultThinkingLevel = concreteThinkingLevel(
+			parseConfiguredThinkingLevel(activeSettings.get("defaultThinkingLevel")),
+		);
 		options.scopedModels = scopedModels.map(scopedModel => ({
 			model: scopedModel.model,
 			thinkingLevel: scopedModel.explicitThinkingLevel
@@ -900,6 +909,13 @@ async function buildSessionOptions(
 
 	// System prompt
 	applyResolvedSystemPromptInputs(options, resolvedSystemPrompt, resolvedAppendPrompt);
+	// Replan-driven title refresh resolves the override from this same field on
+	// `AgentSession`, so threading it through `CreateAgentSessionOptions` keeps
+	// both first-input titling (`input-controller.ts`) and replan refresh
+	// (`AgentSession.#refreshTitleAfterReplan`) on one source of truth.
+	if (titleSystemPrompt) {
+		options.titleSystemPrompt = titleSystemPrompt;
+	}
 
 	// Tools
 	if (parsed.noTools) {
@@ -936,12 +952,13 @@ async function buildSessionOptions(
 		options.additionalExtensionPaths = [];
 	}
 
-	return { options, titleSystemPrompt };
+	return options;
 }
 
 interface RunRootCommandDependencies {
 	createAgentSession?: typeof createAgentSession;
 	discoverAuthStorage?: typeof discoverAuthStorage;
+	selectSession?: typeof selectSession;
 	runAcpMode?: RunAcpMode;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
@@ -1128,7 +1145,8 @@ export async function runRootCommand(
 	// (see issue #1668).
 	if (typeof parsedArgs.resume === "string" && !sessionManager) {
 		writeStartupNotice(parsedArgs, `${chalk.dim("Resume cancelled: session is in another project.")}\n`);
-		return;
+		stopStartupWatchdog();
+		process.exit(0);
 	}
 
 	// Handle --resume (no value): show session picker
@@ -1144,17 +1162,26 @@ export async function runRootCommand(
 			preloadedAllSessions = await logger.time("SessionManager.listAll", SessionManager.listAll);
 			if (preloadedAllSessions.length === 0) {
 				writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
-				return;
+				stopStartupWatchdog();
+				process.exit(0);
 			}
 		}
 		pauseStartupWatchdog();
-		const selected = await logger.time("selectSession", selectSession, folderSessions, {
+		const selected = await logger.time("selectSession", deps.selectSession ?? selectSession, folderSessions, {
 			allSessions: preloadedAllSessions,
 		});
 		resumeStartupWatchdog();
 		if (!selected) {
 			writeStartupNotice(parsedArgs, `${chalk.dim("No session selected")}\n`);
-			return;
+			// Quit instead of returning: startup already armed long-lived handles
+			// (theme watcher + SIGWINCH/macOS appearance listeners via initTheme,
+			// settings save timer, model registry) that keep the event loop alive,
+			// so a bare return hangs the process after the picker leaves the alt
+			// screen. No session was built here, so there is nothing to flush. The
+			// in-session `/resume` picker (selector-controller.ts) takes a different
+			// onCancel that just closes the overlay — only this startup path exits.
+			stopStartupWatchdog();
+			process.exit(0);
 		}
 		// Resuming a session from another project: switch the process into that
 		// project's directory and refresh cwd-derived caches before the session is
@@ -1181,6 +1208,21 @@ export async function runRootCommand(
 		sessionManager = await SessionManager.open(selected.path);
 	}
 
+	if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork)) {
+		const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
+		if (pendingToolWarning) {
+			logger.warn("Resumed session has pending tool calls", {
+				sessionId: sessionManager.getSessionId(),
+				sessionFile: sessionManager.getSessionFile(),
+			});
+			if (isInteractive) {
+				notifs.push({ kind: "warn", message: pendingToolWarning });
+			} else {
+				process.stderr.write(`${chalk.yellow(`${pendingToolWarning}\n`)}`);
+			}
+		}
+	}
+
 	await pluginPreloadPromise;
 
 	scheduleMarketplaceAutoUpdate({
@@ -1189,7 +1231,7 @@ export async function runRootCommand(
 		clearPluginRootsCache: clearPluginRootsAndCaches,
 	});
 
-	const { options: sessionOptions, titleSystemPrompt } = await logger.time(
+	const sessionOptions = await logger.time(
 		"buildSessionOptions",
 		buildSessionOptions,
 		parsedArgs,
@@ -1340,6 +1382,9 @@ export async function runRootCommand(
 		}
 
 		if (!isInteractive && !session.model) {
+			if (modelRegistryError) {
+				process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
+			}
 			if (modelFallbackMessage) {
 				process.stderr.write(`${chalk.red(modelFallbackMessage)}\n`);
 			} else {
@@ -1396,7 +1441,6 @@ export async function runRootCommand(
 				eventBus,
 				initialMessage,
 				initialImages,
-				titleSystemPrompt,
 				parsedArgs.join,
 			);
 		} else {

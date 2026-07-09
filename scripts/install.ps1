@@ -1,4 +1,4 @@
-# RealtimeX Coding Agent Installer for Windows
+# RTX Coding Agent Installer for Windows
 # Usage: irm https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.ps1 | iex
 #
 # Or with options:
@@ -147,7 +147,7 @@ function Configure-BashShell {
         } else {
             Write-Host ""
             Write-Host "⚠ No bash shell found!" -ForegroundColor Yellow
-            Write-Host "  RealtimeX requires a bash shell on Windows. Options:" -ForegroundColor Yellow
+            Write-Host "  RTX requires a bash shell on Windows. Options:" -ForegroundColor Yellow
             Write-Host "    1. Install Git for Windows: https://git-scm.com/download/win" -ForegroundColor Yellow
             Write-Host "    2. Use WSL, Cygwin, or MSYS2" -ForegroundColor Yellow
             Write-Host ""
@@ -239,13 +239,13 @@ function Install-Binary {
     if ($Ref) {
         Write-Host "Fetching release $Ref..."
         try {
-            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Ref"
+            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Ref" -TimeoutSec 60
         } catch {
             throw "Release tag not found: $Ref`nFor branch/commit installs, use -Source with -Ref."
         }
     } else {
         Write-Host "Fetching latest release..."
-        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 60
     }
 
     $Latest = $Release.tag_name
@@ -260,7 +260,7 @@ function Install-Binary {
     $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
     Write-Host "Downloading $BinaryName..."
     $OutPath = Join-Path $InstallDir "rtx.exe"
-    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath
+    Invoke-WebRequest -Uri $BinaryUrl -OutFile $OutPath -TimeoutSec 900
 
     Write-Host ""
     Write-Host "✓ Installed rtx to $OutPath" -ForegroundColor Green

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
-import { $env, filterProcessEnv } from "./env";
+import { $env, filterChildShellEnv } from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -31,7 +31,7 @@ export function isExecutable(path: string): boolean {
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
 	return {
-		...filterProcessEnv(Bun.env),
+		...filterChildShellEnv(Bun.env),
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
@@ -144,7 +144,7 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		}
 
 		throw new Error(
-				`No bash shell found. Options:\n` +
+			`No bash shell found. Options:\n` +
 				`  1. Install Git for Windows: https://git-scm.com/download/win\n` +
 				`  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n` +
 				`  3. Set shellPath in ~/.rtx/agent/settings.json\n\n` +

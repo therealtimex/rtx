@@ -12,7 +12,7 @@ import {
 	type AnthropicModel,
 	bareModelId,
 	type GeminiModel,
-	isFableOrMythos,
+	isAnthropicAdaptiveGenAtLeast,
 	type OpenAIModel,
 	type ParsedModel,
 	parseAnthropicModel,
@@ -301,12 +301,12 @@ function getModelDefinedEfforts<TApi extends Api>(
 ): readonly Effort[] | undefined {
 	if (isGlm52ReasoningEffortModelId(spec.id)) {
 		// Z.ai/Zhipu and OpenRouter both surface GLM-5.2's full effort ladder,
-		// including the top `xhigh` (= "max") tier; Ollama Cloud exposes only
-		// high/xhigh.
+		// including the top `xhigh` (= "max") tier; Umans and Ollama Cloud
+		// expose only high/max.
 		if (isZaiThinkingFormat(compat) || isOpenRouterThinkingFormat(compat)) {
 			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 		}
-		if (isOllamaCloudGlm52ReasoningEffortModel(spec)) {
+		if (isUmansGlm52ReasoningEffortModel(spec) || isOllamaCloudGlm52ReasoningEffortModel(spec)) {
 			return GLM_52_HIGH_MAX_REASONING_EFFORTS;
 		}
 	}
@@ -323,6 +323,10 @@ function getModelDefinedEfforts<TApi extends Api>(
 
 function isOllamaCloudGlm52ReasoningEffortModel<TApi extends Api>(spec: ModelSpec<TApi>): boolean {
 	return spec.api === "ollama-chat" && spec.provider === "ollama-cloud" && isGlm52ReasoningEffortModelId(spec.id);
+}
+
+function isUmansGlm52ReasoningEffortModel<TApi extends Api>(spec: ModelSpec<TApi>): boolean {
+	return spec.api === "anthropic-messages" && spec.provider === "umans" && isGlm52ReasoningEffortModelId(spec.id);
 }
 
 function isMinimaxReasoningModelOnAnthropicEndpoint<TApi extends Api>(spec: ModelSpec<TApi>): boolean {
@@ -378,15 +382,16 @@ function inferDetectedEffortMap<TApi extends Api>(
 	//     `xhigh` 400s — collapse minimal->none, low/medium/high->high, xhigh->max.
 	//   - OpenRouter: `max` 400s and `xhigh` IS its max tier, so it passes `xhigh`
 	//     through literally (no map; the tier is exposed via getModelDefinedEfforts).
-	//   - Other openai-compat hosts (Fireworks, resellers) and Ollama Cloud keep
-	//     their distinct lower tiers and host quirks (e.g. Fireworks rejects
-	//     `minimal`, so `minimal->none` stays) and only remap the top `xhigh` UI
-	//     tier onto the genuine `max` budget. Filtered to supported efforts later.
+	//   - Umans and Ollama Cloud expose only high/max on their GLM-5.2 routes.
+	//   - Other openai-compat hosts (Fireworks, resellers) keep their distinct
+	//     lower tiers and host quirks (e.g. Fireworks rejects `minimal`, so
+	//     `minimal->none` stays) and only remap the top `xhigh` UI tier onto the
+	//     genuine `max` budget. Filtered to supported efforts later.
 	const isGlm52 = isGlm52ReasoningEffortModelId(spec.id);
 	if (isGlm52 && isZaiThinkingFormat(compat)) {
 		return ZAI_GLM_52_REASONING_EFFORT_MAP;
 	}
-	if (isOllamaCloudGlm52ReasoningEffortModel(spec)) {
+	if (isUmansGlm52ReasoningEffortModel(spec) || isOllamaCloudGlm52ReasoningEffortModel(spec)) {
 		return GLM_52_XHIGH_MAX_EFFORT_MAP;
 	}
 	if (isSakanaFuguReasoningModel(spec)) {
@@ -436,12 +441,11 @@ function isDeepseekReasoningModel<TApi extends Api>(spec: ModelSpec<TApi>): bool
 function getOpenRouterAnthropicReasoningEffortMap(modelId: string): EffortMap | undefined {
 	const parsed = parseAnthropicModel(bareModelId(modelId));
 	if (!parsed) return undefined;
-	// Adaptive efforts on OpenRouter's completions front: Fable/Mythos and
-	// Opus 4.6+ only — Sonnet stays on the plain effort vocabulary there.
-	const isOpusAdaptive = parsed.kind === "opus" && semverGte(parsed.version, "4.6");
-	if (!isFableOrMythos(parsed.kind) && !isOpusAdaptive) return undefined;
+	// Adaptive efforts on OpenRouter's completions front: Fable/Mythos, Sonnet 5+,
+	// and Opus 4.6+ only — older Sonnet versions stay on the plain effort vocabulary there.
+	if (!isAnthropicAdaptiveGenAtLeast(parsed, "4.6")) return undefined;
 
-	const hasRealXHigh = isFableOrMythos(parsed.kind) || semverGte(parsed.version, "4.7");
+	const hasRealXHigh = isAnthropicAdaptiveGenAtLeast(parsed, "4.7");
 	return hasRealXHigh ? ANTHROPIC_ADAPTIVE_EFFORT_MAP_5_TIER : ANTHROPIC_ADAPTIVE_EFFORT_MAP_4_TIER;
 }
 
@@ -516,7 +520,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
-		return parsedModel.kind === "opus" || isFableOrMythos(parsedModel.kind)
+		return isAnthropicAdaptiveGenAtLeast(parsedModel, "4.6")
 			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH
 			: DEFAULT_REASONING_EFFORTS;
 	}
@@ -577,11 +581,18 @@ function inferThinkingControlMode<TApi extends Api>(
 			if (isMinimaxReasoningModelOnAnthropicEndpoint(spec)) {
 				return "anthropic-adaptive";
 			}
+			if (isUmansGlm52ReasoningEffortModel(spec)) {
+				return "anthropic-budget-effort";
+			}
 			if (parsedModel.family === "anthropic") {
 				if (semverGte(parsedModel.version, "4.6")) {
 					return "anthropic-adaptive";
 				}
-				if (semverGte(parsedModel.version, "4.5")) {
+				// Opus 4.5 supports `output_config.effort` (sent alongside
+				// `thinking.budget_tokens`); Sonnet 4.5 and Haiku 4.5 reject the
+				// field with HTTP 400 "This model does not support the effort
+				// parameter." (#3497).
+				if (parsedModel.kind === "opus" && semverGte(parsedModel.version, "4.5")) {
 					return "anthropic-budget-effort";
 				}
 			}
@@ -589,13 +600,13 @@ function inferThinkingControlMode<TApi extends Api>(
 
 		case "bedrock-converse-stream":
 			if (parsedModel.family === "anthropic") {
-				if (
-					semverGte(parsedModel.version, "4.6") &&
-					(parsedModel.kind === "opus" || isFableOrMythos(parsedModel.kind))
-				) {
+				if (isAnthropicAdaptiveGenAtLeast(parsedModel, "4.6")) {
 					return "anthropic-adaptive";
 				}
-				if (semverGte(parsedModel.version, "4.5")) {
+				// Opus 4.5 on Bedrock metadata mirrors the direct-Anthropic
+				// shape; the Bedrock provider still emits plain budget thinking
+				// on the wire for the budget-effort mode.
+				if (parsedModel.kind === "opus" && semverGte(parsedModel.version, "4.5")) {
 					return "anthropic-budget-effort";
 				}
 			}
@@ -612,19 +623,18 @@ function isOpenRouterAnthropicAdaptiveReasoningModel<TApi extends Api>(
 ): boolean {
 	if (!isOpenAICompatReasoningApi(spec.api)) return false;
 	if (!modelMatchesHost(spec, "openrouter")) return false;
-	return isFableOrMythos(parsedModel.kind) || (parsedModel.kind === "opus" && semverGte(parsedModel.version, "4.6"));
+	return isAnthropicAdaptiveGenAtLeast(parsedModel, "4.6");
 }
 
 /**
- * Opus 4.7+ and Fable/Mythos on the Messages API expose the full five-tier
+ * Opus 4.7+, Sonnet 5+, and Fable/Mythos 5+ on the Messages API expose the full five-tier
  * adaptive scale (low/medium/high/xhigh/max). Bedrock Converse stays on the
  * four-tier scale regardless of model version.
  */
 function anthropicModelHasRealXHighEffort<TApi extends Api>(spec: ModelSpec<TApi>, parsedModel: ParsedModel): boolean {
 	if (spec.api !== "anthropic-messages") return false;
 	if (parsedModel.family !== "anthropic") return false;
-	if (isFableOrMythos(parsedModel.kind)) return true;
-	return parsedModel.kind === "opus" && semverGte(parsedModel.version, "4.7");
+	return isAnthropicAdaptiveGenAtLeast(parsedModel, "4.7");
 }
 
 // ---------------------------------------------------------------------------

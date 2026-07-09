@@ -35,13 +35,14 @@ const DIFFICULTY_SYSTEM_PROMPT = prompt.render(difficultySystemPrompt);
 const MAX_INPUT_CHARS = 6000;
 const HEAD_CHARS = 4000;
 const TAIL_CHARS = 2000;
-/** The online answer is a single word; keep budgets tiny for non-reasoning backends. */
-const ANSWER_MAX_TOKENS = 8;
 /** Local classifiers occasionally need more room for chat-template boilerplate. */
 const LOCAL_ANSWER_MAX_TOKENS = 16;
 /**
- * Reasoning backends ignore `disableReasoning` on some providers, so reserve
- * enough output room for the keyword to still land after unavoidable thinking.
+ * Online classifier budget. Sized to survive backends that ignore
+ * `disableReasoning` (e.g. Qwen3 via llama.cpp catalogued `reasoning: false`
+ * but still emitting thinking): the classifier keyword needs to land after any
+ * unavoidable thinking preamble. `maxTokens` is a hard cap — non-thinking
+ * completions still return in a handful of tokens (issue #4355).
  */
 const REASONING_SAFE_MAX_TOKENS = 1024;
 
@@ -55,10 +56,15 @@ export interface ClassifyDifficultyDeps {
 }
 
 /**
- * Classify `promptText` and return a concrete effort clamped to `deps.model`.
+ * Classify `promptText` and return a concrete effort clamped to `deps.model`,
+ * or `undefined` when the model has no controllable effort surface (auto has
+ * nothing to pick — the caller leaves the prior reasoning level in place).
  * @throws when the backend cannot produce a usable classification.
  */
-export async function classifyDifficulty(promptText: string, deps: ClassifyDifficultyDeps): Promise<Effort> {
+export async function classifyDifficulty(
+	promptText: string,
+	deps: ClassifyDifficultyDeps,
+): Promise<Effort | undefined> {
 	const backend = deps.settings.get("providers.autoThinkingModel");
 	const input = prepareClassifierInput(promptText);
 	const effort =
@@ -69,10 +75,10 @@ export async function classifyDifficulty(promptText: string, deps: ClassifyDiffi
 }
 
 async function classifyOnline(input: string, deps: ClassifyDifficultyDeps): Promise<Effort> {
-	const resolved = resolveRoleSelection(["smol"], deps.settings, deps.registry.getAvailable(), deps.registry);
+	const resolved = resolveRoleSelection(["tiny", "smol"], deps.settings, deps.registry.getAvailable());
 	const model = resolved?.model;
 	if (!model) {
-		throw new Error("auto-thinking: no smol model available for classification");
+		throw new Error("auto-thinking: no tiny/smol model available for classification");
 	}
 	const apiKey = await deps.registry.getApiKey(model, deps.sessionId);
 	if (!apiKey) {
@@ -80,7 +86,7 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps): Prom
 	}
 	// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
 	const metadata = deps.metadataResolver?.(model.provider);
-	const maxTokens = model.reasoning ? Math.max(ANSWER_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS) : ANSWER_MAX_TOKENS;
+	const maxTokens = REASONING_SAFE_MAX_TOKENS;
 
 	const response = await completeSimple(
 		model,

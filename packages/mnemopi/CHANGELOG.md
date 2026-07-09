@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+## [16.3.9] - 2026-07-06
+
+### Fixed
+
+- Fixed extractor JSON parsing to correctly unwrap object-shaped facts, instructions, preferences, and timeline items from known text fields instead of persisting literal `[object Object]` rows.
+
+## [16.3.7] - 2026-07-05
+
+### Added
+
+- Added `RecallOptions.contentPreviewChars` to allow customizing or disabling the content preview cap (default is 500, set to 0 for full content).
+- Added `RecallResult.truncated` and `RecallResult.full_length` properties to easily identify clipped previews without parsing trailing markers.
+
+### Fixed
+
+- Fixed background LLM fact extraction to preserve specific extractor categories (`instructions`, `preferences`, `timelines`, and `kg` triples) in MEMORIA tables and graph triples instead of flattening them into generic `fact/entity` rows.
+- Improved recall previews and `factLine` context to append a trailing ellipsis (`…`) when content is clipped, preventing mid-word truncation without a marker.
+
+## [16.3.5] - 2026-07-04
+
+### Fixed
+
+- Fixed `remember(..., { embedText })` so hosts can store full transcripts while embedding, FTS-indexing, and rebuild-reembedding a marker-free projection. ([#4395](https://github.com/can1357/oh-my-pi/issues/4395))
+
+## [16.2.2] - 2026-06-27
+
+### Fixed
+
+- Improved resilience during API extraction calls by enhancing the handling of rate limits and transient errors.
+
+## [16.1.17] - 2026-06-24
+
+### Fixed
+
+- Fixed `remember(..., { extract: true })` fact/entity extraction accepting an `extractText` override so hosts can store full transcripts while mining facts from a safer projection; also tightened deterministic `Instruction:` extraction to require an explicit `I`/`you` subject instead of treating every `always`/`never` clause as a user instruction. ([#3372](https://github.com/can1357/oh-my-pi/issues/3372))
+
 ## [16.1.8] - 2026-06-20
 
 ### Fixed

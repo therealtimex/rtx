@@ -30,8 +30,8 @@ import {
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
+	getNativeProjectDirNames,
 	loadFilesFromDir,
-	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
 
@@ -39,8 +39,6 @@ const PROVIDER_ID = "native";
 const DISPLAY_NAME = "RealtimeX";
 const DESCRIPTION = "Native RealtimeX configuration from ~/.rtx and .rtx/";
 const PRIORITY = 100;
-
-const PATHS = SOURCE_PATHS.native;
 
 async function ifNonEmptyDir(...seg: string[]): Promise<string | null> {
 	let dir = path.join(...seg);
@@ -54,10 +52,22 @@ async function ifNonEmptyDir(...seg: string[]): Promise<string | null> {
 	return null;
 }
 
+async function findNativeProjectConfigDir(baseDir: string): Promise<string | null> {
+	for (const projectDirName of getNativeProjectDirNames()) {
+		const projectDir = await ifNonEmptyDir(baseDir, projectDirName);
+		if (projectDir) return projectDir;
+	}
+	return null;
+}
+
+function nativeProjectSubpaths(baseDir: string, subpath: string): string[] {
+	return getNativeProjectDirNames().map(projectDirName => path.join(baseDir, projectDirName, subpath));
+}
+
 async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; level: "user" | "project" }>> {
 	const result: Array<{ dir: string; level: "user" | "project" }> = [];
 
-	const projectDir = await ifNonEmptyDir(ctx.cwd, PATHS.projectDir);
+	const projectDir = await findNativeProjectConfigDir(ctx.cwd);
 	if (projectDir) {
 		result.push({ dir: projectDir, level: "project" });
 	}
@@ -91,7 +101,7 @@ async function findNearestProjectConfigDir(
 	repoRoot?: string | null,
 ): Promise<{ dir: string; depth: number } | null> {
 	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
-		const configDir = await ifNonEmptyDir(ancestor.dir, PATHS.projectDir);
+		const configDir = await findNativeProjectConfigDir(ancestor.dir);
 		if (configDir) return { dir: configDir, depth: ancestor.depth };
 	}
 	return null;
@@ -194,8 +204,8 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	// stays in sync with getMCPConfigPath("user") and the /mcp config writer.
 	const userAgentDir = getAgentDir();
 	const paths = [
-		{ path: path.join(ctx.cwd, PATHS.projectDir, "mcp.json"), level: "project" as const },
-		{ path: path.join(ctx.cwd, PATHS.projectDir, ".mcp.json"), level: "project" as const },
+		...nativeProjectSubpaths(ctx.cwd, "mcp.json").map(path => ({ path, level: "project" as const })),
+		...nativeProjectSubpaths(ctx.cwd, ".mcp.json").map(path => ({ path, level: "project" as const })),
 		{ path: path.join(userAgentDir, "mcp.json"), level: "user" as const },
 		{ path: path.join(userAgentDir, ".mcp.json"), level: "user" as const },
 	];
@@ -272,13 +282,15 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .omp/skills/ in ancestors (closest first)
 	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
-	const projectScans = ancestors.map(({ dir }) =>
-		scanSkillsFromDir(ctx, {
-			dir: path.join(dir, PATHS.projectDir, "skills"),
-			providerId: PROVIDER_ID,
-			level: "project",
-			requireDescription: true,
-		}),
+	const projectScans = ancestors.flatMap(({ dir }) =>
+		nativeProjectSubpaths(dir, "skills").map(projectSkillsDir =>
+			scanSkillsFromDir(ctx, {
+				dir: projectSkillsDir,
+				providerId: PROVIDER_ID,
+				level: "project",
+				requireDescription: true,
+			}),
+		),
 	);
 
 	// User-level scan from ~/.omp/agent/skills/
@@ -401,7 +413,8 @@ async function loadStickyRulesFile(filePath: string, level: "user" | "project"):
 	const content = await readFile(filePath);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, filePath, level);
-	const rule = buildRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName: "RULES" });
+	const ruleName = level === "project" ? "RULES@project" : "RULES";
+	const rule = buildRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName });
 	// Force alwaysApply regardless of frontmatter — the whole point of RULES.md
 	// is to be reattached every turn.
 	return { ...rule, alwaysApply: true };

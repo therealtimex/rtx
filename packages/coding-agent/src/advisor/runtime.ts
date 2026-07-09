@@ -1,14 +1,27 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
+import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
 
-/** Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core `Agent`. */
+/**
+ * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
+ * `Agent`. `state.error` mirrors `Agent.state.error`: provider/stream failures
+ * the loop catches internally never reject `prompt()`, so the runtime reads
+ * this field after every prompt to detect a failed turn.
+ */
 export interface AdvisorAgent {
 	prompt(input: string): Promise<void>;
 	abort(reason?: unknown): void;
 	reset(): void;
-	readonly state: { messages: AgentMessage[] };
+	/**
+	 * Drop messages appended past `count`. Called after a failed `prompt()` so a
+	 * retry doesn't replay the failed user batch + synthetic assistant-error
+	 * turn `Agent.#runLoop` records on its internal state.
+	 */
+	rollbackTo?(count: number): void;
+	readonly state: { messages: AgentMessage[]; error?: string };
 }
 
 export interface AdvisorRuntimeHost {
@@ -16,6 +29,8 @@ export interface AdvisorRuntimeHost {
 	snapshotMessages(): AgentMessage[];
 	/** Surface one advice note to the primary (enqueues into the session YieldQueue). */
 	enqueueAdvice(note: string, severity?: "nit" | "concern" | "blocker"): void;
+	/** Redact primary transcript bytes before they reach the advisor model. */
+	obfuscator?: SecretObfuscator;
 	/**
 	 * Pre-prompt context maintenance for the advisor's own append-only context.
 	 * Promotes the advisor model to a larger sibling when its context nears the
@@ -26,6 +41,26 @@ export interface AdvisorRuntimeHost {
 	 * the primary's next compaction triggers {@link AdvisorRuntime.reset}).
 	 */
 	maintainContext?(incomingTokens: number): Promise<boolean>;
+	/**
+	 * Called immediately before each `agent.prompt(batch)` cycle. Lets the host
+	 * clear per-update advisor state — currently the one-advise-per-update gate
+	 * in {@link AdvisorEmissionGuard}, which the host owns because it is the
+	 * one that routes `advise()` results back to the primary.
+	 */
+	beginAdvisorUpdate?(): void;
+	/**
+	 * Called with the error of every failed advisor turn, before the retry sleep
+	 * or the dropped-after-3 path. Lets the host apply credential-level remedies
+	 * the advisor loop lacks: the in-stream a/b/c auth retry rotates through
+	 * sibling credentials within one request but never blocks the LAST failing
+	 * one — the primary agent's retry pipeline does that via
+	 * `markUsageLimitReached`, so without this hook the advisor re-picks the
+	 * same usage-limited account on every retry. Errors thrown here are logged
+	 * and swallowed.
+	 */
+	onTurnError?(error: unknown): Promise<void> | void;
+	/** Surface a non-recovering advisor failure to the host UI without adding model-visible context. */
+	notifyFailure?(error: unknown): void;
 }
 
 interface PendingDelta {
@@ -52,6 +87,7 @@ export class AdvisorRuntime {
 	#busy = false;
 	#backlog = 0;
 	#consecutiveFailures = 0;
+	#failureNotified = false;
 	#latestMessages?: AgentMessage[];
 	#waiters: CatchupWaiter[] = [];
 	/** Bumped by every external {@link reset}/{@link dispose}. A drain iteration
@@ -110,6 +146,7 @@ export class AdvisorRuntime {
 		this.#pending = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#wakeAllWaiters();
 		try {
 			this.agent.abort("advisor disposed");
@@ -120,6 +157,7 @@ export class AdvisorRuntime {
 		this.#lastCount = 0;
 		this.#pending = [];
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#seenContext.clear();
 		if (clearBacklog) {
 			this.#backlog = 0;
@@ -157,6 +195,7 @@ export class AdvisorRuntime {
 		this.#pending = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#failureNotified = false;
 		this.#seenContext.clear();
 		this.#wakeAllWaiters();
 	}
@@ -174,11 +213,14 @@ export class AdvisorRuntime {
 			.map(m => this.#dedupContextMessage(m));
 		this.#lastCount = all.length;
 		if (delta.length === 0) return null;
-		const md = formatSessionHistoryMarkdown(delta, {
+		const obfuscator = this.host.obfuscator;
+		const formattedDelta = obfuscator?.hasSecrets() ? obfuscateAdvisorDelta(obfuscator, delta) : delta;
+		const md = formatSessionHistoryMarkdown(formattedDelta, {
 			includeThinking: true,
 			includeToolIntent: true,
 			watchedRoles: true,
 			expandPrimaryContext: true,
+			expandEditDiffs: true,
 		});
 		if (!md.trim()) return null;
 		return `### Session update\n\n${md}`;
@@ -217,6 +259,28 @@ export class AdvisorRuntime {
 	#wakeAllWaiters(): void {
 		for (const w of [...this.#waiters]) {
 			w.finish();
+		}
+	}
+
+	/**
+	 * Drop the user batch + synthetic assistant-error turn `Agent.#runLoop`
+	 * appended for a failed prompt so a retry replays a clean baseline and the
+	 * dropped-after-3 path never leaks orphan failures into the next successful
+	 * run. Prefers the agent's own `rollbackTo` (which also re-syncs its
+	 * append-only context); falls back to truncating `state.messages` for tests
+	 * that hand-roll a minimal facade.
+	 */
+	#rollbackFailedTurn(snapshot: number): void {
+		const messages = this.agent.state.messages;
+		if (messages.length <= snapshot) return;
+		try {
+			if (this.agent.rollbackTo) {
+				this.agent.rollbackTo(snapshot);
+				return;
+			}
+			messages.length = snapshot;
+		} catch (err) {
+			logger.debug("advisor rollback failed", { err: String(err) });
 		}
 	}
 
@@ -268,20 +332,56 @@ export class AdvisorRuntime {
 				}
 
 				let success = false;
+				// Capture the advisor's message count BEFORE the prompt so a failure can
+				// roll back the user batch + synthetic assistant-error turn `Agent.#runLoop`
+				// appends to internal state. Without this, a retry would replay the
+				// failed batch on top of the stale turns and the dropped-after-3 path
+				// would leak orphan failures into the next successful run's context.
+				const messageSnapshot = this.agent.state.messages.length;
 				try {
+					// Reset the host's per-update advisor state (one-advise-per-update
+					// gate) before each model cycle, so the new batch starts with a
+					// fresh budget. Dedupe history persists across cycles.
+					this.host.beginAdvisorUpdate?.();
 					await this.agent.prompt(batch);
+					// `Agent.#runLoop` catches provider/stream failures internally and
+					// resolves `prompt()` cleanly with the assistant turn ending in
+					// `stopReason: "error"` and the message recorded on `state.error`.
+					// Treat that as a failed turn so OpenRouter ZDR-style endpoint
+					// rejections trip the retry/notify path instead of looking like a
+					// successful empty cycle.
+					const promptError = this.agent.state.error;
+					if (promptError) throw new Error(promptError);
 					success = true;
 					this.#consecutiveFailures = 0;
+					this.#failureNotified = false;
 				} catch (err) {
 					// reset()/dispose() aborts the in-flight prompt; the rejection is the
 					// reset itself, not a transient advisor failure. Drop the stale batch
 					// (reset already cleared #pending and rewound the cursor) instead of
 					// requeuing it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
+					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
+					try {
+						await this.host.onTurnError?.(err);
+					} catch (hookErr) {
+						logger.debug("advisor onTurnError hook failed", { err: String(hookErr) });
+					}
+					// The hook awaits; a reset during it invalidates this batch like the
+					// prompt await above — drop it instead of requeueing stale content.
+					if (this.#epoch !== epoch) continue;
 					this.#consecutiveFailures++;
 					if (this.#consecutiveFailures >= 3) {
 						logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+						if (!this.#failureNotified) {
+							this.#failureNotified = true;
+							try {
+								this.host.notifyFailure?.(err);
+							} catch (notifyErr) {
+								logger.warn("advisor failure notification failed", { err: String(notifyErr) });
+							}
+						}
 						this.#consecutiveFailures = 0;
 						// The dropped batch may carry primary-context we never delivered; drop
 						// the seen-state too so the next turn re-expands it instead of marking
@@ -303,4 +403,135 @@ export class AdvisorRuntime {
 			this.#busy = false;
 		}
 	}
+}
+
+type TextualContent = string | readonly (TextContent | ImageContent)[];
+
+function obfuscateTextualContent(obfuscator: SecretObfuscator, content: TextualContent): TextualContent {
+	if (typeof content === "string") return obfuscator.obfuscate(content);
+	let changed = false;
+	const result = content.map((block): TextContent | ImageContent => {
+		if (block.type !== "text") return block;
+		const text = obfuscator.obfuscate(block.text);
+		if (text === block.text) return block;
+		changed = true;
+		return { ...block, text };
+	});
+	return changed ? result : content;
+}
+
+function obfuscateAssistantMessage(obfuscator: SecretObfuscator, message: AssistantMessage): AssistantMessage {
+	let changed = false;
+	const content = message.content.map((block): AssistantMessage["content"][number] => {
+		if (block.type === "text") {
+			const text = obfuscator.obfuscate(block.text);
+			if (text === block.text) return block;
+			changed = true;
+			return { ...block, text };
+		}
+		if (block.type === "toolCall") {
+			const args = obfuscateToolArguments(obfuscator, block.arguments);
+			if (args === block.arguments) return block;
+			changed = true;
+			return { ...block, arguments: args };
+		}
+		return block;
+	});
+	return changed ? { ...message, content } : message;
+}
+
+function obfuscateDetails(
+	obfuscator: SecretObfuscator,
+	details: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+	if (!details) return details;
+	// Walk strings at every depth: `customOneLiner` renders nested fields
+	// (e.g. `async-result` reads `details.jobs[].label`/`jobId`), so a shallow
+	// pass leaks any secret a background job's label happens to contain.
+	return obfuscateToolArguments(obfuscator, details);
+}
+
+function obfuscateAdvisorMessage(obfuscator: SecretObfuscator, message: AgentMessage): AgentMessage {
+	switch (message.role) {
+		case "user":
+		case "developer": {
+			const content = obfuscateTextualContent(obfuscator, message.content as TextualContent);
+			return content === message.content ? message : ({ ...(message as object), content } as AgentMessage);
+		}
+		case "toolResult": {
+			const msg = message as AgentMessage & {
+				content: TextualContent;
+				details?: Record<string, unknown>;
+			};
+			const content = obfuscateTextualContent(obfuscator, msg.content);
+			const details = obfuscateDetails(obfuscator, msg.details);
+			if (content === msg.content && details === msg.details) return message;
+			return { ...(message as object), content, details } as AgentMessage;
+		}
+		case "assistant":
+			return obfuscateAssistantMessage(obfuscator, message as AssistantMessage) as AgentMessage;
+		case "custom":
+		case "hookMessage": {
+			const msg = message as AgentMessage & {
+				content: TextualContent;
+				details?: Record<string, unknown>;
+			};
+			const content = obfuscateTextualContent(obfuscator, msg.content);
+			const details = obfuscateDetails(obfuscator, msg.details);
+			if (content === msg.content && details === msg.details) return message;
+			return { ...(message as object), content, details } as AgentMessage;
+		}
+		case "bashExecution": {
+			const msg = message as AgentMessage & { command: string; output: string };
+			const command = obfuscator.obfuscate(msg.command);
+			const output = obfuscator.obfuscate(msg.output);
+			return command === msg.command && output === msg.output
+				? message
+				: ({ ...(message as object), command, output } as AgentMessage);
+		}
+		case "pythonExecution": {
+			const msg = message as AgentMessage & { code: string; output: string };
+			const code = obfuscator.obfuscate(msg.code);
+			const output = obfuscator.obfuscate(msg.output);
+			return code === msg.code && output === msg.output
+				? message
+				: ({ ...(message as object), code, output } as AgentMessage);
+		}
+		case "branchSummary": {
+			const msg = message as AgentMessage & { summary: string };
+			const summary = obfuscator.obfuscate(msg.summary);
+			return summary === msg.summary ? message : ({ ...(message as object), summary } as AgentMessage);
+		}
+		case "compactionSummary": {
+			const msg = message as AgentMessage & { summary: string };
+			const summary = obfuscator.obfuscate(msg.summary);
+			return summary === msg.summary ? message : ({ ...(message as object), summary } as AgentMessage);
+		}
+		case "fileMention": {
+			const msg = message as AgentMessage & {
+				files: Array<{ path: string; content: string; image?: unknown }>;
+			};
+			let changed = false;
+			const files = msg.files.map(file => {
+				const path = obfuscator.obfuscate(file.path);
+				const content = obfuscator.obfuscate(file.content);
+				if (path === file.path && content === file.content) return file;
+				changed = true;
+				return { ...file, path, content };
+			});
+			return changed ? ({ ...(message as object), files } as AgentMessage) : message;
+		}
+		default:
+			return message;
+	}
+}
+
+function obfuscateAdvisorDelta(obfuscator: SecretObfuscator, messages: AgentMessage[]): AgentMessage[] {
+	let changed = false;
+	const result = messages.map(message => {
+		const next = obfuscateAdvisorMessage(obfuscator, message);
+		if (next !== message) changed = true;
+		return next;
+	});
+	return changed ? result : messages;
 }

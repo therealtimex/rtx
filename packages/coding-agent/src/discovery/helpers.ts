@@ -18,6 +18,7 @@ import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { parseThinkingLevel } from "../thinking";
+import { normalizeToolNames } from "../tools/builtin-names";
 
 import { buildPluginDirRoot } from "./plugin-dir-roots";
 
@@ -80,6 +81,11 @@ export const SOURCE_PATHS = {
 		projectDir: ".vscode",
 	},
 } as const;
+
+export function getNativeProjectDirNames(): string[] {
+	const configured = getConfigDirName();
+	return [CONFIG_DIR_NAME, configured, ".omp"].filter((dir, index, dirs) => dirs.indexOf(dir) === index);
+}
 
 export type SourceId = keyof typeof SOURCE_PATHS;
 
@@ -246,7 +252,8 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		return null;
 	}
 
-	let tools = parseArrayOrCSV(frontmatter.tools)?.map(tool => tool.toLowerCase());
+	let tools = parseArrayOrCSV(frontmatter.tools);
+	if (tools) tools = normalizeToolNames(tools);
 
 	// Subagents with explicit tool lists always need yield
 	if (tools && !tools.includes("yield")) {
@@ -310,6 +317,15 @@ export interface ScanSkillsFromDirOptions {
 	providerId: string;
 	level: "user" | "project";
 	requireDescription?: boolean;
+	/**
+	 * When true, treat a `SKILL.md` sitting directly under `dir` as a single skill in addition to
+	 * scanning `<dir>/<name>/SKILL.md` children. Matches the Claude plugin manifest convention
+	 * that lets a skill path point at a directory containing `SKILL.md` directly (e.g.
+	 * `"skills": ["./"]`), where the frontmatter `name` determines the invocation name and the
+	 * directory basename is the fallback. Default `false` preserves the strict child-scan
+	 * semantic every non-Claude provider relies on.
+	 */
+	includeSelf?: boolean;
 }
 
 // Stable ordering used for skill lists in prompts: name (case-insensitive), then name, then path.
@@ -366,7 +382,13 @@ export async function scanSkillsFromDir(
 		}
 	};
 
-	const work = [];
+	const work: Promise<void>[] = [];
+	if (options.includeSelf) {
+		const selfSkillPath = path.join(dir, "SKILL.md");
+		if (fs.existsSync(selfSkillPath)) {
+			work.push(loadSkill(selfSkillPath));
+		}
+	}
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
@@ -770,39 +792,38 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
-	// Pass 1: walk up looking for an existing .omp/ directory (nearest wins).
-	// Stop before os.homedir() — ~/.omp/ is the user-level config dir, not a project root.
 	const homeDir = os.homedir();
 	let dir = path.resolve(cwd);
 	while (dir !== homeDir) {
-		try {
-			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
-			if (stat.isDirectory()) {
-				return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+		for (const projectDirName of getNativeProjectDirNames()) {
+			try {
+				const stat = await fs.promises.stat(path.join(dir, projectDirName));
+				if (stat.isDirectory()) {
+					return path.join(dir, projectDirName, "plugins", "installed_plugins.json");
+				}
+			} catch {
+				// not found at this level; continue checking
 			}
-		} catch {
-			// not found at this level — continue up
 		}
 		const parent = path.dirname(dir);
-		if (parent === dir) break; // filesystem root
+		if (parent === dir) break;
 		dir = parent;
 	}
 
-	// Pass 2: walk up looking for .git as a fallback anchor.
 	dir = path.resolve(cwd);
 	while (dir !== homeDir) {
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
 			return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
 		} catch {
-			// not found at this level — continue up
+			// not found at this level; continue up
 		}
 		const parent = path.dirname(dir);
-		if (parent === dir) break; // filesystem root
+		if (parent === dir) break;
 		dir = parent;
 	}
 
-	return null; // not inside any project
+	return null;
 }
 
 /**
@@ -827,6 +848,13 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 }
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
+
+const pluginCacheInvalidators = new Set<() => void>();
+
+/** Register a process-global plugin cache invalidator called whenever plugin roots are cleared. */
+export function registerPluginCacheInvalidator(invalidator: () => void): void {
+	pluginCacheInvalidators.add(invalidator);
+}
 
 /**
  * List all installed Claude Code plugin roots from the plugin cache.
@@ -1007,6 +1035,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
+	for (const invalidate of pluginCacheInvalidators) invalidate();
 	preloadedPluginRoots = [...injectedPluginDirRoots];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {

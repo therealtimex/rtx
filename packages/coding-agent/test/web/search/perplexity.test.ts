@@ -138,7 +138,7 @@ describe("Perplexity API-key request shape", () => {
 
 		expect(response.relatedQuestions).toBeUndefined();
 	});
-	it("falls back to OpenRouter with the selected API-key config after direct Perplexity fails", async () => {
+	it("falls back to OpenRouter with the selected API-key config after a non-retryable direct Perplexity failure", async () => {
 		process.env.OPENROUTER_API_KEY = "openrouter-test-key";
 		const urls: string[] = [];
 		const bodies: Record<string, unknown>[] = [];
@@ -146,7 +146,7 @@ describe("Perplexity API-key request shape", () => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 			urls.push(url);
 			bodies.push(JSON.parse(init?.body as string));
-			if (url === API_URL) return new Response("direct failed", { status: 500 });
+			if (url === API_URL) return new Response("direct failed", { status: 400 });
 			if (url === OPENROUTER_API_URL) return sseResponse(baseResponse());
 			return new Response("not mocked", { status: 500 });
 		};
@@ -428,6 +428,70 @@ describe("Perplexity anonymous fallback", () => {
 
 		expect(provider.isAvailable(anonymousAuthStorage)).toBe(false);
 		expect(provider.isExplicitlyAvailable(anonymousAuthStorage)).toBe(true);
+	});
+});
+
+describe("Perplexity OpenRouter auto-chain admission (issue #3251)", () => {
+	const savedKey = process.env.PERPLEXITY_API_KEY;
+	const savedPplxKey = process.env.PPLX_API_KEY;
+	const savedCookies = process.env.PERPLEXITY_COOKIES;
+
+	beforeEach(() => {
+		delete process.env.PERPLEXITY_API_KEY;
+		delete process.env.PPLX_API_KEY;
+		delete process.env.PERPLEXITY_COOKIES;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		if (savedKey === undefined) delete process.env.PERPLEXITY_API_KEY;
+		else process.env.PERPLEXITY_API_KEY = savedKey;
+		if (savedPplxKey === undefined) delete process.env.PPLX_API_KEY;
+		else process.env.PPLX_API_KEY = savedPplxKey;
+		if (savedCookies === undefined) delete process.env.PERPLEXITY_COOKIES;
+		else process.env.PERPLEXITY_COOKIES = savedCookies;
+	});
+
+	it("keeps Perplexity out of the auto chain when only OpenRouter auth is configured", () => {
+		const openrouterOnly = {
+			async getOAuthAccess() {
+				return undefined;
+			},
+			async getApiKey() {
+				return undefined;
+			},
+			hasAuth(provider: string) {
+				return provider === "openrouter";
+			},
+		} as unknown as AuthStorage;
+
+		const provider = new PerplexityProvider();
+
+		// Auto chain MUST skip Perplexity so downstream providers (Gemini, ...)
+		// get a chance instead of silently routing through OpenRouter's
+		// `perplexity/sonar-pro` and billing the user for an unrequested path.
+		expect(provider.isAvailable(openrouterOnly)).toBe(false);
+		// Explicit selection still admits the provider so `webSearch: perplexity`
+		// can opt into the OpenRouter-backed path on purpose.
+		expect(provider.isExplicitlyAvailable(openrouterOnly)).toBe(true);
+	});
+
+	it("admits Perplexity to the auto chain when a direct Perplexity credential exists", () => {
+		const perplexityOnly = {
+			async getOAuthAccess() {
+				return undefined;
+			},
+			async getApiKey() {
+				return undefined;
+			},
+			hasAuth(provider: string) {
+				return provider === "perplexity";
+			},
+		} as unknown as AuthStorage;
+
+		const provider = new PerplexityProvider();
+
+		expect(provider.isAvailable(perplexityOnly)).toBe(true);
 	});
 });
 

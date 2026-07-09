@@ -1,10 +1,18 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getConfigAgentDirName, getProjectDir } from "@oh-my-pi/pi-utils";
+import { CONFIG_DIR_NAME, getConfigAgentDirName, getConfigDirName, getProjectDir } from "@oh-my-pi/pi-utils";
 import { expandTilde } from "./tools/path-utils";
 
 export * from "./config/config-file";
+
+const LEGACY_NATIVE_PROJECT_DIR_NAME = ".omp";
+const getNativeProjectDirNames = (): string[] =>
+	[
+		CONFIG_DIR_NAME,
+		...(getConfigDirName() !== CONFIG_DIR_NAME ? [getConfigDirName()] : []),
+		LEGACY_NATIVE_PROJECT_DIR_NAME,
+	].filter((dir, index, dirs) => dirs.indexOf(dir) === index);
 
 const priorityList = [
 	{ dir: CONFIG_DIR_NAME, globalAgentDir: getConfigAgentDirName },
@@ -85,10 +93,12 @@ const USER_CONFIG_BASES = priorityList.map(({ dir, globalAgentDir }) => ({
 	name: dir,
 }));
 
-const PROJECT_CONFIG_BASES = priorityList.map(({ dir }) => ({
-	base: dir,
-	name: dir,
-}));
+const PROJECT_CONFIG_BASES = [
+	...getNativeProjectDirNames().map(dir => ({ base: dir, name: dir })),
+	{ base: ".claude", name: ".claude" },
+	{ base: ".codex", name: ".codex" },
+	{ base: ".gemini", name: ".gemini" },
+];
 
 export interface ConfigDirEntry {
 	path: string;

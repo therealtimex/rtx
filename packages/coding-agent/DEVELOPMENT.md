@@ -1,6 +1,6 @@
 # Developing `@oh-my-pi/pi-coding-agent`
 
-This package is the `omp` CLI. This file is a **developer's map**: where things live
+This package is the `rtx` CLI. This file is a **developer's map**: where things live
 in `src/`, how to run the local loops, and — for each subsystem — which document in
 the repo [`docs/`](../../docs/) tree is the authoritative reference.
 
@@ -21,12 +21,12 @@ Run from `packages/coding-agent/` (or add `--cwd=packages/coding-agent`):
 | Tests | `bun run test` |
 | Autofix: lint + format prompts + docs index | `bun run fix` |
 | Reformat prompt `.md` assets | `bun run format-prompts` |
-| Regenerate the `docs://` index | `bun run generate-docs-index` |
+| Regenerate the `docs://` index | `bun run gen:docs` |
 | Build the `dist/rtx` binary | `bun run build` |
 
 Never invoke `tsc`/`npx tsc` directly — `bun run check` is the typecheck gate. After
 changing the React tool renderers under `collab-web/src/tool-render/`, rebuild them
-with `bun --cwd=packages/collab-web run build:tool-views`.
+with `bun run gen:tool-views`.
 
 ## Boot flow
 
@@ -149,7 +149,7 @@ Top-level entry modules: `cli.ts`, `main.ts`, `sdk.ts`, `index.ts` (SDK barrel),
 - [macos-signing-notarization.md](../../docs/macos-signing-notarization.md)
 - [porting-from-pi-mono.md](../../docs/porting-from-pi-mono.md)
 
-## Extending omp
+## Extending rtx
 
 | To add… | Start here |
 |---|---|

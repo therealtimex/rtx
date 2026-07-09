@@ -309,6 +309,34 @@ describe("Editor component", () => {
 			await expect(promise).resolves.toBe("/");
 		});
 
+		it("renders slash-command suggestions as compact item rows", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteMaxVisible(10);
+			const longDescription =
+				"Plan and execute non-trivial architectural improvements to the codebase without turning each slash command into a multi-line block.";
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider(
+					Array.from({ length: 12 }, (_, i) => ({
+						name: `cmd${i}`,
+						description: longDescription,
+					})),
+					"/tmp",
+				),
+			);
+
+			const { promise: autocompleteUpdated, resolve: resolveAutocompleteUpdated } = Promise.withResolvers<void>();
+			editor.onAutocompleteUpdate = resolveAutocompleteUpdated;
+
+			editor.handleInput("/");
+			await autocompleteUpdated;
+
+			const rendered = editor.render(80).map(line => stripVTControlCharacters(line));
+			for (let i = 0; i < 10; i += 1) {
+				expect(rendered.some(line => line.includes(`cmd${i}`))).toBe(true);
+			}
+			expect(rendered.some(line => line.includes("cmd10"))).toBe(false);
+		});
+
 		it("triggers file-reference autocomplete when typing at-sign", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			const { promise, resolve } = Promise.withResolvers<string>();
@@ -752,6 +780,28 @@ describe("Editor component", () => {
 			expect(contentLine).not.toContain("\x1b[5m");
 			// Line should still be correct width
 			expect(visibleWidth(contentLine)).toBeLessThanOrEqual(width);
+		});
+
+		it("keeps the bordered editor inside `width` when the cursor lands past a wide trailing grapheme (#3431)", () => {
+			// Regression: typing a fullwidth char (e.g. CJK comma `，`, U+FF0C) at the end
+			// of the input used to push the bottom-right `─╯` 1–2 cells past the terminal
+			// edge, wrapping `╯` to its own row. The end-of-line cursor glyph + wide grapheme
+			// extends into the right padding zone; the right chrome must shrink by the exact
+			// overflow cell count.
+			for (const paddingX of [1, 2]) {
+				const theme = { ...defaultEditorTheme, editorPaddingX: paddingX };
+				const minContentWidth = 2 * (paddingX + 1) + 3; // chrome + "，" (2) + cursor (1)
+				for (let width = minContentWidth; width <= minContentWidth + 6; width++) {
+					const editor = new Editor(theme);
+					editor.focused = true;
+					for (const c of "asd，") editor.handleInput(c);
+					const lines = editor.render(width);
+					for (const line of lines) {
+						const stripped = line.replaceAll(CURSOR_MARKER, "");
+						expect(visibleWidth(stripped)).toBeLessThanOrEqual(width);
+					}
+				}
+			}
 		});
 
 		it("shows cursor at end before wrap and wraps on next char", () => {

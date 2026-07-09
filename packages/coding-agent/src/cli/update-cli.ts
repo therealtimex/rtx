@@ -10,13 +10,11 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import {
-	fetchLatestRtxRelease,
-	findRtxReleaseAsset,
-	getRtxReleaseAssetName,
-	type RtxReleaseInfo,
-} from "./rtx-release";
+import { theme } from "../modes/theme/theme";
+import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
+import { fetchLatestRtxRelease, type RtxReleaseInfo } from "./rtx-release";
 
+const REPO = "therealtimex/rtx";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
@@ -24,14 +22,15 @@ const MISE_TOOL = "github:can1357/oh-my-pi";
  * Official npm registry origin.
  *
  * Pinned across both the version check and the bun install step so the two
- * agree on which catalog they are talking to. A user's bun may be pointed at an
- * unofficial mirror (corporate proxy, Taobao, etc.) that lags the upstream
- * registry by minutes-to-hours, in which case a registry lookup would resolve a
- * version the mirror has not yet replicated and the install would fail with `No
- * version matching "X" found for specifier "<pkg>" (but package exists)`.
+ * agree on which catalog they are talking to. A user's bun may be pointed at
+ * an unofficial mirror (corporate proxy, Taobao, etc.) that lags the upstream
+ * registry by minutes-to-hours, in which case `getLatestRelease` would resolve
+ * a version the mirror has not yet replicated and the install would fail with
+ * `No version matching "X" found for specifier "<pkg>" (but package exists)`.
  * See #1686.
  */
 const NPM_REGISTRY = "https://registry.npmjs.org/";
+const BINARY_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 
 /**
  * Core native addon package. Bumped in lock-step with {@link PACKAGE} so the
@@ -80,7 +79,7 @@ export interface BinaryReplacementOptions {
  * Parse update subcommand arguments.
  * Returns undefined if not an update command.
  */
-export function parseUpdateArgs(args: string[]): { force: boolean; check: boolean } | undefined {
+export function parseUpdateArgs(args: string[]): { force: boolean; check: boolean; plugins: boolean } | undefined {
 	if (args.length === 0 || args[0] !== "update") {
 		return undefined;
 	}
@@ -88,6 +87,7 @@ export function parseUpdateArgs(args: string[]): { force: boolean; check: boolea
 	return {
 		force: args.includes("--force") || args.includes("-f"),
 		check: args.includes("--check") || args.includes("-c"),
+		plugins: args.includes("--plugins") || args.includes("-l"),
 	};
 }
 
@@ -159,12 +159,17 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
-
-/**
- * Get the latest release info from the GitHub release channel used by this fork.
+/** * Get the latest release info from the GitHub release channel used by this fork.
  */
 async function getLatestRelease(): Promise<RtxReleaseInfo> {
-	return fetchLatestRtxRelease();
+	try {
+		return await fetchLatestRtxRelease();
+	} catch (err) {
+		if (isTimeoutError(err)) {
+			throw new Error("Timed out fetching release info after 30s", { cause: err });
+		}
+		throw err;
+	}
 }
 
 /**
@@ -174,11 +179,258 @@ async function getLatestRelease(): Promise<RtxReleaseInfo> {
  * - positive if a > b
  */
 function compareVersions(a: string, b: string): number {
-	return Bun.semver.order(a, b);
+	const pa = a.split(".").map(Number);
+	const pb = b.split(".").map(Number);
+
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const na = pa[i] || 0;
+		const nb = pb[i] || 0;
+		if (na !== nb) return na - nb;
+	}
+	return 0;
+}
+
+interface BunInstallCachePruneResult {
+	scannedPackages: number;
+	removedEntries: number;
+}
+
+interface BunCachePackageGroup {
+	actualDirs: Map<string, string[]>;
+	markerDir?: string;
+	markerEntries: Map<string, string[]>;
+}
+
+function stripBunCacheVersionSuffix(name: string): string {
+	const metadataIndex = name.indexOf("@@");
+	return metadataIndex === -1 ? name : name.slice(0, metadataIndex);
+}
+
+function compareSemverIdentifier(a: string, b: string): number {
+	const aNumber = /^\d+$/.test(a);
+	const bNumber = /^\d+$/.test(b);
+	if (aNumber && bNumber) return Number(a) - Number(b);
+	if (aNumber) return -1;
+	if (bNumber) return 1;
+	return a.localeCompare(b);
+}
+
+function compareSemverLikeVersions(a: string, b: string): number {
+	const [aCoreWithPrerelease] = a.split("+", 1);
+	const [bCoreWithPrerelease] = b.split("+", 1);
+	const [aCore, aPrerelease] = aCoreWithPrerelease.split("-", 2);
+	const [bCore, bPrerelease] = bCoreWithPrerelease.split("-", 2);
+	const aParts = aCore.split(".");
+	const bParts = bCore.split(".");
+	for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+		const diff = Number(aParts[i] ?? 0) - Number(bParts[i] ?? 0);
+		if (diff !== 0 && Number.isFinite(diff)) return diff;
+	}
+	if (!aPrerelease && !bPrerelease) return 0;
+	if (!aPrerelease) return 1;
+	if (!bPrerelease) return -1;
+	const aPrereleaseParts = aPrerelease.split(".");
+	const bPrereleaseParts = bPrerelease.split(".");
+	for (let i = 0; i < Math.max(aPrereleaseParts.length, bPrereleaseParts.length); i++) {
+		const aPart = aPrereleaseParts[i];
+		const bPart = bPrereleaseParts[i];
+		if (aPart === undefined) return -1;
+		if (bPart === undefined) return 1;
+		const diff = compareSemverIdentifier(aPart, bPart);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+async function readdirIfExists(dir: string): Promise<fs.Dirent[]> {
+	try {
+		return await fs.promises.readdir(dir, { withFileTypes: true });
+	} catch (err) {
+		if (isEnoent(err)) return [];
+		throw err;
+	}
+}
+
+function getBunCacheGroup(groups: Map<string, BunCachePackageGroup>, packageName: string): BunCachePackageGroup {
+	let group = groups.get(packageName);
+	if (!group) {
+		group = { actualDirs: new Map(), markerEntries: new Map() };
+		groups.set(packageName, group);
+	}
+	return group;
+}
+
+function addVersionPath(entries: Map<string, string[]>, version: string, entryPath: string): void {
+	const paths = entries.get(version);
+	if (paths) {
+		paths.push(entryPath);
+		return;
+	}
+	entries.set(version, [entryPath]);
+}
+
+async function addBunCacheActualDir(
+	groups: Map<string, BunCachePackageGroup>,
+	dirPath: string,
+	packageNames: Set<string> | undefined,
+): Promise<void> {
+	try {
+		const manifest = (await Bun.file(path.join(dirPath, "package.json")).json()) as Partial<
+			Record<"name" | "version", unknown>
+		>;
+		if (typeof manifest.name !== "string" || typeof manifest.version !== "string") return;
+		if (packageNames && !packageNames.has(manifest.name)) return;
+		const group = getBunCacheGroup(groups, manifest.name);
+		addVersionPath(group.actualDirs, manifest.version, dirPath);
+	} catch (err) {
+		if (isEnoent(err)) return;
+		throw err;
+	}
+}
+
+async function addBunCacheMarkerDir(
+	groups: Map<string, BunCachePackageGroup>,
+	packageName: string,
+	markerDir: string,
+	packageNames: Set<string> | undefined,
+): Promise<void> {
+	if (packageNames && !packageNames.has(packageName)) return;
+	const markerEntries = await readdirIfExists(markerDir);
+	const group = getBunCacheGroup(groups, packageName);
+	group.markerDir = markerDir;
+	for (const entry of markerEntries) {
+		const cacheVersion = stripBunCacheVersionSuffix(entry.name);
+		addVersionPath(group.markerEntries, cacheVersion, path.join(markerDir, entry.name));
+	}
+}
+
+async function collectBunCacheGroups(
+	cacheDir: string,
+	packageNames: Set<string> | undefined,
+): Promise<Map<string, BunCachePackageGroup>> {
+	const groups = new Map<string, BunCachePackageGroup>();
+	for (const entry of await readdirIfExists(cacheDir)) {
+		if (!entry.isDirectory()) continue;
+		const entryPath = path.join(cacheDir, entry.name);
+		if (entry.name.startsWith("@")) {
+			for (const scopedEntry of await readdirIfExists(entryPath)) {
+				if (!scopedEntry.isDirectory()) continue;
+				const scopedEntryPath = path.join(entryPath, scopedEntry.name);
+				const versionSeparator = scopedEntry.name.lastIndexOf("@");
+				if (versionSeparator === -1) {
+					await addBunCacheMarkerDir(groups, `${entry.name}/${scopedEntry.name}`, scopedEntryPath, packageNames);
+				} else {
+					await addBunCacheActualDir(groups, scopedEntryPath, packageNames);
+				}
+			}
+			continue;
+		}
+		const versionSeparator = entry.name.lastIndexOf("@");
+		if (versionSeparator === -1) {
+			await addBunCacheMarkerDir(groups, entry.name, entryPath, packageNames);
+		} else {
+			await addBunCacheActualDir(groups, entryPath, packageNames);
+		}
+	}
+	return groups;
+}
+
+async function removeCacheEntries(paths: string[]): Promise<number> {
+	for (const entryPath of paths) {
+		await fs.promises.rm(entryPath, { recursive: true, force: true });
+	}
+	return paths.length;
 }
 
 /**
- * Resolve the path that the rtx app name maps to in the user's PATH.
+ * Prune Bun's package cache so each package keeps only its newest cached version.
+ *
+ * Bun stores package cache entries as both a package marker directory
+ * (`react/19.2.6@@@1`) and a materialized package directory
+ * (`react@19.2.6@@@1`). Global `omp` updates can leave one full copy per
+ * release. The marker and materialized entries are removed together so the
+ * cache stays internally consistent.
+ */
+export async function pruneBunInstallCache(
+	cacheDir: string,
+	packageNames?: Set<string>,
+): Promise<BunInstallCachePruneResult> {
+	const groups = await collectBunCacheGroups(cacheDir, packageNames);
+	let scannedPackages = 0;
+	let removedEntries = 0;
+	for (const group of groups.values()) {
+		if (group.actualDirs.size === 0) continue;
+		scannedPackages++;
+		let latestVersion: string | undefined;
+		for (const version of group.actualDirs.keys()) {
+			if (!latestVersion || compareSemverLikeVersions(version, latestVersion) > 0) latestVersion = version;
+		}
+		if (!latestVersion) continue;
+		for (const [version, paths] of group.actualDirs) {
+			if (version !== latestVersion) removedEntries += await removeCacheEntries(paths);
+		}
+		for (const [version, paths] of group.markerEntries) {
+			if (version !== latestVersion) removedEntries += await removeCacheEntries(paths);
+		}
+	}
+	return { scannedPackages, removedEntries };
+}
+
+export function resolveBunGlobalNodeModulesDirFromLocations(
+	globalBinDir: string | undefined,
+	cacheDir: string | undefined,
+): string | undefined {
+	if (globalBinDir && globalBinDir.length > 0) {
+		return path.join(path.dirname(globalBinDir), "install", "global", "node_modules");
+	}
+	if (cacheDir && cacheDir.length > 0) {
+		return path.join(path.dirname(cacheDir), "global", "node_modules");
+	}
+	return undefined;
+}
+
+/**
+ * Get the appropriate binary name for this platform.
+ */
+function getBinaryName(): string {
+	const platform = process.platform;
+	const arch = process.arch;
+
+	let os: string;
+	switch (platform) {
+		case "linux":
+			os = "linux";
+			break;
+		case "darwin":
+			os = "darwin";
+			break;
+		case "win32":
+			os = "windows";
+			break;
+		default:
+			throw new Error(`Unsupported platform: ${platform}`);
+	}
+
+	let archName: string;
+	switch (arch) {
+		case "x64":
+			archName = "x64";
+			break;
+		case "arm64":
+			archName = "arm64";
+			break;
+		default:
+			throw new Error(`Unsupported architecture: ${arch}`);
+	}
+
+	if (os === "windows") {
+		return `${APP_NAME}-${os}-${archName}.exe`;
+	}
+	return `${APP_NAME}-${os}-${archName}`;
+}
+
+/**
+ * Resolve the path that `rtx` maps to in the user's PATH.
  */
 function resolveRtxPath(): string | undefined {
 	return $which(APP_NAME) ?? undefined;
@@ -204,7 +456,7 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 }
 
 function printVerifiedVersion(expectedVersion: string): void {
-	console.log(chalk.green(`\nUpdated to ${expectedVersion}`));
+	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
 }
 
 function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
@@ -310,9 +562,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 /**
  * Build the bun argv used to globally install a specific omp version.
  *
- * This fork updates the rtx CLI from GitHub release assets, but this helper is
- * retained for inherited tests and package-manager compatibility. If used, the
- * install MUST observe the same catalog as the registry lookup:
+ * The version is selected by hitting {@link NPM_REGISTRY} directly in
+ * {@link getLatestRelease}, so the install MUST observe the same catalog:
  *
  * - `--registry=${NPM_REGISTRY}` pins the install to the official registry
  *   regardless of the user's bunfig/`.npmrc`. A mirror (corporate proxy,
@@ -321,9 +572,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * - `--no-cache` tells bun to ignore its on-disk manifest snapshot so it
  *   re-fetches metadata from that registry on every invocation.
  *
- * Together these two flags made the inherited package-manager update path
- * produce exactly the registry lookup the version check just performed. See
- * #1686.
+ * Together these two flags make `omp update` produce exactly the registry
+ * lookup the version check just performed. See #1686.
  *
  * Also pins {@link NATIVES_PACKAGE} and the platform-specific
  * `@oh-my-pi/pi-natives-<tag>` leaf to `expectedVersion`. `bun install -g`
@@ -369,17 +619,31 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 /**
  * Download a release binary to a target path, replacing an existing file.
  */
-async function updateViaBinaryAt(targetPath: string, release: RtxReleaseInfo, assetName: string): Promise<void> {
-	const asset = findRtxReleaseAsset(release, assetName);
+async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
+	const binaryName = getBinaryName();
+	const tag = `v${expectedVersion}`;
+	const url = `https://github.com/${REPO}/releases/download/${tag}/${binaryName}`;
+
 	const tempPath = `${targetPath}.new`;
 	// Unique per attempt: a stale backup from an earlier update may still be
 	// locked (it is the previous process image on Windows), and a fixed name
 	// would force the move-aside rename to overwrite it. pid + timestamp keeps
 	// two forced updates in the same millisecond from colliding.
 	const backupPath = `${targetPath}.${Date.now()}.${process.pid}.bak`;
-	console.log(chalk.dim(`Downloading ${asset.name}…`));
+	console.log(chalk.dim(`Downloading ${binaryName}…`));
 
-	const response = await fetch(asset.browser_download_url, { redirect: "follow" });
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			redirect: "follow",
+			signal: withTimeoutSignal(BINARY_DOWNLOAD_TIMEOUT_MS),
+		});
+	} catch (err) {
+		if (isTimeoutError(err)) {
+			throw new Error("Timed out downloading release binary after 15 minutes", { cause: err });
+		}
+		throw err;
+	}
 	if (!response.ok || !response.body) {
 		throw new Error(`Download failed: ${response.statusText}`);
 	}
@@ -391,12 +655,12 @@ async function updateViaBinaryAt(targetPath: string, release: RtxReleaseInfo, as
 		targetPath,
 		tempPath,
 		backupPath,
-		expectedVersion: release.version,
+		expectedVersion,
 		verifyInstalledVersion,
 	});
 	// Reclaim backups from earlier updates whose owning process has since exited.
 	await sweepStaleBackups(targetPath);
-	printVerifiedVersion(release.version);
+	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
 
@@ -406,6 +670,7 @@ async function updateViaBinaryAt(targetPath: string, release: RtxReleaseInfo, as
 export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
+	// Check for updates
 	let release: RtxReleaseInfo;
 	try {
 		release = await getLatestRelease();
@@ -417,7 +682,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	const comparison = compareVersions(release.version, VERSION);
 
 	if (comparison <= 0 && !opts.force) {
-		console.log(chalk.green("Already up to date"));
+		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;
 	}
 
@@ -427,29 +692,15 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
-	let assetName: string;
-	try {
-		assetName = getRtxReleaseAssetName();
-		findRtxReleaseAsset(release, assetName);
-	} catch (err) {
-		console.error(chalk.red(`Update failed: ${err}`));
-		console.error(
-			chalk.yellow(
-				`Reinstall with: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
-			),
-		);
-		process.exit(1);
-	}
-
 	if (opts.check) {
-		console.log(chalk.dim(`Release asset: ${assetName}`));
+		// Just check, don't install
 		return;
 	}
 
 	try {
 		const targetPath = resolveRtxPath();
 		if (!targetPath) throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
-		await updateViaBinaryAt(targetPath, release, assetName);
+		await updateViaBinaryAt(targetPath, release.version);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
 		console.error(
@@ -471,12 +722,14 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} update [options]
 
 ${chalk.bold("Options:")}
-  -c, --check   Check for updates without installing
-  -f, --force   Force reinstall even if up to date
+  -c, --check     Check for updates without installing
+  -f, --force     Force reinstall even if up to date
+  -l, --plugins   Update installed plugins
 
 ${chalk.bold("Examples:")}
-  ${APP_NAME} update           Update to latest version
-  ${APP_NAME} update --check   Check if updates are available
-  ${APP_NAME} update --force   Force reinstall
+  ${APP_NAME} update              Update to latest version
+  ${APP_NAME} update --check      Check if updates are available
+  ${APP_NAME} update --force      Force reinstall
+  ${APP_NAME} update -l           Update installed plugins
 `);
 }

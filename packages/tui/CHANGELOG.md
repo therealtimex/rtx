@@ -2,6 +2,155 @@
 
 ## [Unreleased]
 
+## [16.3.12] - 2026-07-08
+
+### Fixed
+
+- Fixed selector rendering when a legacy theme omits symbol settings by falling back to an ASCII cursor instead of crashing ([#4745](https://github.com/can1357/oh-my-pi/issues/4745)).
+- Kept slash command autocomplete rows compact by truncating descriptions instead of wrapping them into multi-line blocks.
+- Fixed mid-prompt skill autocomplete so Tab and Enter accept the highlighted `/skill:<name>` suggestion and Backspace dismisses the popup immediately after removing the triggering slash ([#4619](https://github.com/can1357/oh-my-pi/issues/4619)).
+- Fixed submitted slash-command arguments treating `@` file-reference tokens as prompt-composer autocomplete triggers when the command does not define argument completions. ([#4600](https://github.com/can1357/oh-my-pi/issues/4600))
+- Fixed box-drawing tree lines (`├── item` — directory layouts, decision trees) in prose shearing apart when they wrap: continuation rows now hang under the node text with ancestor rails carried through (`├` → `│`, `└` → blank) instead of restarting at column 0. Applies to prose paragraphs (including inside blockquotes) only when a line with a branch-connector prefix (`├──`, `└─`, …) actually overflows; fitting lines, non-tree prose, and code blocks render byte-for-byte as before.
+
+## [16.3.10] - 2026-07-06
+
+### Fixed
+
+- Registered emergency terminal restore with the postmortem fatal path whenever a real terminal starts, so fatal exits restore raw mode/alternate screen on the normal CLI graph (previously the registration was a side effect of a barrel module the CLI never imported).
+
+## [16.3.9] - 2026-07-06
+
+### Fixed
+
+- Fixed autocompletion for absolute paths (such as `/tmp/...` or `/Users/...`) at the start of a prompt, ensuring they fall back to file-path completion instead of being incorrectly treated as slash commands.
+- Updated absolute path autocompletion behavior so that accepting a suggestion inserts the path without submitting the prompt.
+
+## [16.3.7] - 2026-07-05
+
+### Fixed
+
+- Fixed an issue where `@` file-reference tokens in slash-command arguments incorrectly triggered prompt-composer autocompletion when the command did not define argument completions.
+- Fixed a memory leak caused by unbounded map growth in the image budget cache.
+
+## [16.3.6] - 2026-07-04
+
+### Added
+
+- Added `Markdown.getLastRenderSettledRows()`: the rendered frozen-token-prefix row count of the most recent streaming render, exposed (hard-monotone per text lineage) for native-scrollback commit gating. Frozen-prefix code blocks now syntax-highlight during streaming renders so settled rows stay byte-stable across finalize.
+
+### Changed
+
+- Rewrote the native-scrollback commit law around a visual-record model: whatever scrolls above the viewport enters history exactly once, in order — nothing painted ever vanishes. `NativeScrollbackLiveRegion` is now a single method (`getNativeScrollbackLiveRegionStart`) reporting an exactness boundary: rows below it commit as exact audited bytes; rows above it commit as frozen visual snapshots that are audit-exempt while their source stays live and strict-verified exactly once when the boundary passes them (a divergence recommits the final content below the frozen fragment — duplication, never loss). `getNativeScrollbackCommitSafeEnd`/`getNativeScrollbackSnapshotSafeEnd` and the heuristic promotion machinery they fed are removed.
+- Simplified committed-prefix auditing to one hard-verified mark deriving three zones (verified/newly-final/frozen); a frame that shrinks below the committed row count re-bases at the first divergence against the recorded prefix so a collapsing live suffix never re-shows or re-commits already-recorded rows.
+
+### Fixed
+
+- Fixed live tool/eval preview boxes spraying duplicated stale copies into native scrollback mid-run: a still-live block's scrolled rows are now frozen visual snapshots that never re-anchor while it runs; at most one repair happens at finalize.
+- Fixed streamed content vanishing above the viewport mid-turn: scrolled-off rows always reach native scrollback (as exact bytes for declared-final content, as visual snapshots otherwise) instead of being deferred invisibly.
+
+## [16.3.5] - 2026-07-04
+
+### Fixed
+
+- Fixed the modifyOtherKeys keyboard fallback enabling on unknown SSH terminals, avoiding broken Shift input in iOS SSH clients such as Redock ([#4325](https://github.com/can1357/oh-my-pi/issues/4325)).
+
+## [16.3.3] - 2026-07-02
+
+### Fixed
+
+- Fixed keyboard fallback behavior (modifyOtherKeys) on unknown SSH terminals, resolving broken Shift input in iOS SSH clients like Redock.
+- Fixed a native scrollback rendering bug where finalized transcript rows below an active block would duplicate when the active block expanded.
+- Fixed autocomplete popups remaining active with stale suggestions after destructive text editing (such as Ctrl+W, Ctrl+U, Ctrl+K, Alt+Backspace, Alt+D, paste, or yank), preventing input corruption when pressing Tab or Enter.
+- Skipped Markdown re-lex + re-wrap when `setText` receives the identical text, mirroring the equality guard on `Text.setText` — cuts one of the top streaming CPU hotspots when providers re-emit unchanged content ([#4353](https://github.com/can1357/oh-my-pi/issues/4353)).
+
+## [16.3.0] - 2026-07-02
+
+### Fixed
+
+- Fixed a potential event loop hang when processing oversized, unterminated terminal escape sequences (OSC/DCS/APC).
+- Fixed an issue where large Windows terminal session restores could get truncated mid-frame during ConPTY full-paint resume.
+
+## [16.2.13] - 2026-07-01
+
+### Fixed
+
+- Fixed fuzzy-search filtering for CJK and other non-ASCII queries by preserving Unicode letters and numbers during query normalization ([#4114](https://github.com/can1357/oh-my-pi/issues/4114)).
+
+## [16.2.12] - 2026-07-01
+
+### Fixed
+
+- Optimized streaming markdown rendering to reuse already-rendered prefix lines and only render new content deltas, improving performance and reducing redraw flicker.
+
+## [16.2.10] - 2026-06-30
+
+### Fixed
+
+- Fixed mid-prompt `/skill:<name>` autocomplete acceptance wiping the user's draft. The autocomplete now inserts the `/skill:<name> ` token at the cursor (replacing only the partial `/sk` slash token) and preserves prose typed before and after it, so a user can compose a prompt and reach for a skill without losing their train of thought ([#3913](https://github.com/can1357/oh-my-pi/issues/3913)).
+
+## [16.2.9] - 2026-06-30
+
+### Added
+
+- Added `Editor.submit()` to allow programmatic composer submission, enabling integration with speech input and other automated flows.
+
+## [16.2.7] - 2026-06-30
+
+### Fixed
+
+- Fixed an issue where a fast double-Escape keypress was swallowed and ignored, preventing double-escape gestures and subsequent Escape key handlers from firing.
+
+## [16.2.3] - 2026-06-28
+
+### Added
+
+- Added a desktop notification fallback for Linux terminals using D-Bus (via notify-send or gdbus), enabling completion and prompt notifications in VTE-family terminals (such as GNOME Terminal, Ptyxis, Tilix), Alacritty, and xterm. This is automatically skipped for terminals with native notification support (like VS Code and Warp) and can be disabled using the PI_NO_DESKTOP_NOTIFY=1 environment variable.
+
+### Fixed
+
+- Fixed slash skill autocomplete not opening when there is existing prompt text, ensuring mid-prompt slash lookups correctly display and insert skill commands.
+- Fixed modified Enter and keyboard shortcuts in fullscreen overlays for terminals using the xterm modifyOtherKeys fallback (such as iTerm2 when Kitty keyboard negotiation is unavailable).
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added support for rendering HTML <code>, <hr>, and <blockquote> tags with proper theme styling, entity decoding, and layout consistency across Markdown transcripts, table cells, list items, and option labels.
+- Added first-class support for Warp terminal (TERM_PROGRAM=WarpTerminal), enabling true color, platform-specific Kitty graphics protocol negotiation for inline images, and safe defaults for OSC 8 hyperlinks and synchronized output.
+- Added SelectList.routeMouse() and shared SGR mouse input routing helpers to support fullscreen overlay hit-testing.
+
+### Fixed
+
+- Fixed issues where stray, unmatched, or raw HTML tags would leak into the rendered output.
+- Fixed render scheduling to yield behind queued terminal input, preventing delayed Escape key delivery during heavy streaming paints.
+
+## [16.1.20] - 2026-06-25
+
+### Fixed
+
+- Recognized Warp (`TERM_PROGRAM=WarpTerminal`) as a first-class terminal, enabling Kitty inline images on macOS/Linux while keeping Warp's unsafe OSC 8 hyperlinks and Windows Kitty graphics disabled ([#3471](https://github.com/can1357/oh-my-pi/issues/3471)).
+- Kept queued interrupt keys ahead of ordinary repaints so a slow long-transcript frame cannot consume the Ctrl+C/Esc double-press window before the second key is handled.
+
+## [16.1.19] - 2026-06-25
+
+### Fixed
+
+- Fixed bordered `Editor` rendering 1–2 cells past the terminal width when the end-of-line cursor glyph landed past a wide trailing grapheme (CJK comma `，`, emoji, etc.), wrapping the bottom-right corner (`╯`) to its own row. The right chrome (padding + `─` + corner) now shrinks by the exact cursor overflow cell count instead of a 1-cell boolean, so the box stays inside `width` for any `paddingX` ([#3431](https://github.com/can1357/oh-my-pi/issues/3431)).
+
+## [16.1.17] - 2026-06-24
+
+### Added
+
+- Added runtime resolution of the Hangul Compatibility Jamo (U+3131..U+318E) display width for terminals known to disagree with the platform default (e.g. Ghostty, which renders these at 2 cells). Fixes doubled/ghosted jamo during Korean IME composition; the resolved width is pushed into the native width engine before the first paint. Other terminals keep the platform default (macOS narrow, otherwise UAX#11), so the override is a no-op outside Ghostty. A runtime DSR/CPR probe for unknown terminals is tracked separately.
+- Added `setHangulCompatibilityJamoWidth` / `getHangulCompatibilityJamoWidth` to set the jamo width profile (`"platform" | "unicode" | 1 | 2`); the profile is mirrored into the native `setHangulCompatJamoWidthOverride`.
+
+### Fixed
+
+- Removed the 30-second OSC 11 background-color poll that ran on terminals without DEC Mode 2031 support (macOS Terminal.app, Warp, VS Code's built-in terminal, older Alacritty/WezTerm). Each poll's OSC 11 + DA1 write wiped the user's active text selection on several of those terminals, causing intermittent "can't copy" failures whenever a poll fired mid-drag — most visibly during the Ask tool dialog when the user wants to quote text back from the conversation ([#3297](https://github.com/can1357/oh-my-pi/issues/3297)). Theme detection now relies on the initial startup probe plus Mode 2031 push notifications; affected terminals pick up OS-theme changes on next launch.
+- Fixed `@`-path autocomplete failing on Windows for paths outside the cwd. Windows absolute paths (e.g. `C:\\Users\\...`) were not detected as absolute — only `/` was checked — so they were incorrectly joined with the base directory, producing invalid search paths and empty suggestions. Path-join calls also introduced backslashes into suggestion values, breaking round-trip insertion. Absolute path detection now uses `path.isAbsolute()` (handles drive letters) and suggestion paths are normalized to forward slashes (valid on all platforms).
+- Fixed settings rows crashing native text truncation when a malformed config value reaches the renderer as a non-string ([#3338](https://github.com/can1357/oh-my-pi/issues/3338)).
+- Fixed desktop notifications being silently lost under tmux on the common stack of tmux + kitty/ghostty/wezterm/iTerm2. `TERMINAL_ID` resolves to the inner terminal (whose markers leak into the tmux session env), which maps to `NotifyProtocol.Osc9` / `NotifyProtocol.Osc99`, and `sendNotification()` wrote that raw OSC straight to stdout — tmux dropped it on the floor and `monitor-bell` / `monitor-activity` never fired, so a backgrounded omp pane had no way to flag completion or `ask` blockage. Under `TMUX`, OSC-protocol notifications are now wrapped in tmux's `\x1bPtmux;…\x1b\\` DCS passthrough envelope (so users with `set -g allow-passthrough on` still get the real toast on the outer terminal) and followed by a `\x07` BEL (so `set -g monitor-bell on` reliably flags the window otherwise). The OSC 99 capability probe in `terminal.ts` is wrapped the same way so rich notifications keep working across tmux. `NotifyProtocol.Bell` paths are unchanged. ([#3395](https://github.com/can1357/oh-my-pi/issues/3395))
+
 ## [16.1.10] - 2026-06-21
 
 ### Fixed
@@ -510,7 +659,7 @@
 
 ### Changed
 
-- Changed native-scrollback safety defaults to treat unknown POSIX, SSH, and multiplexer-shaped terminals as ED3-risk for passive rendering; checkpoint replay now requires a positive at-tail viewport proof instead of assuming prompt submit makes host scrollback safe ([#1799](https://github.com/can1357/oh-my-pi/issues/1799)).
+- Changed native-scrollback safety defaults to treat unknown POSIX, SSH, and multiplexer-shaped terminals as ED3-risk for passive rendering; checkpoint replay now requires a positive at-tail viewport proof instead of assuming prompt submit makes host scrollback safe.
 - Changed synchronized-output defaults to a conservative opt-in profile: DEC 2026 paint wrappers stay disabled for remote/multiplexer/VTE/unknown terminals unless explicitly forced, while the autowrap guards remain active.
 
 ### Fixed
