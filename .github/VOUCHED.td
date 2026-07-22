@@ -81,11 +81,13 @@ kenmege
 korri123
 kukkerem
 lance0
+larkinwc
 ldx
 lederniermagicien
 loftiskg
 lyc-aon
 m3ridian-zero
+maatheusgois-dd
 makomakogo
 masonc15
 mathews-tom
@@ -108,6 +110,7 @@ parsifa1
 pgupta-git
 phanthh
 pidevxplay
+pppobear
 qfrtt
 ravshansbox
 rburketaylor
@@ -131,11 +134,13 @@ tdiant
 tjboudreaux
 tsagi2045
 turbomolli
+unravl
 usr-bin-roygbiv
 vmcall
 voidchecksum
 voiys
 watzon
+will-bogusz will-bogusz
 wodenjay
 wolfiesch
 xaviergmail

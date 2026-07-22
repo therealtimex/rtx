@@ -8,11 +8,15 @@ export interface RtxReleaseAsset {
 export interface RtxReleaseInfo {
 	tag: string;
 	version: string;
+	targetCommitish?: string;
+	prerelease: boolean;
 	assets: RtxReleaseAsset[];
 }
 
 interface GithubReleasePayload {
 	tag_name?: unknown;
+	target_commitish?: unknown;
+	prerelease?: unknown;
 	assets?: unknown;
 }
 
@@ -90,6 +94,10 @@ function parseGithubReleasePayload(payload: GithubReleasePayload): RtxReleaseInf
 	return {
 		tag: payload.tag_name,
 		version: normalizeGithubReleaseVersion(payload.tag_name),
+		...(typeof payload.target_commitish === "string" && payload.target_commitish.length > 0
+			? { targetCommitish: payload.target_commitish }
+			: {}),
+		prerelease: payload.prerelease === true,
 		assets,
 	};
 }

@@ -15,13 +15,16 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
-import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -68,7 +71,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	async function createSession() {
+	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 
@@ -100,7 +103,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const sessionManager = SessionManager.inMemory();
-		const settings = Settings.isolated();
+		const settings = Settings.isolated(settingsOverrides);
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
@@ -174,6 +177,86 @@ describe("AgentSession concurrent prompt guard", () => {
 		session.agent.clearAllQueues();
 		await session.abort();
 		await firstPrompt.catch(() => {});
+	});
+
+	it("queues sendUserMessage as steer while streaming without AgentBusyError", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// The first agent loop may dequeue a steer before the assertion runs, so
+		// observe agent.steer itself rather than the residual queue length.
+		const steered: AgentMessage[] = [];
+		const originalSteer = session.agent.steer.bind(session.agent);
+		session.agent.steer = (message: AgentMessage) => {
+			steered.push(message);
+			originalSteer(message);
+		};
+
+		// Extension path: no deliverAs while busy must queue, not throw.
+		await expect(session.sendUserMessage("hello from extension")).resolves.toBeUndefined();
+		expect(steered).toHaveLength(1);
+		const queued = steered[0];
+		expect(queued?.role).toBe("user");
+		if (queued?.role === "user") {
+			expect(queued.content).toEqual([{ type: "text", text: "hello from extension" }]);
+			expect(queued.steering).toBe(true);
+		}
+
+		session.agent.clearAllQueues();
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("sendUserMessage without deliverAs preserves prompt-flow keyword notices while streaming", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		try {
+			await session.sendUserMessage("ultrathink fix via extension");
+			const queuedShape = session.agent
+				.peekSteeringQueue()
+				.map(message => (message.role === "custom" ? message.customType : message.role));
+			expect(queuedShape).toEqual(["ultrathink-notice", "user"]);
+			expect(session.getQueuedMessages()).toEqual({
+				steering: ["ultrathink fix via extension"],
+				followUp: [],
+			});
+		} finally {
+			session.agent.clearAllQueues();
+			await session.abort();
+			await firstPrompt.catch(() => {});
+		}
+	});
+
+	it("sendUserMessage without deliverAs starts a normal prompt when idle", async () => {
+		await createSession();
+
+		let rejected: unknown;
+		let settled = false;
+		const turn = session
+			.sendUserMessage("Idle extension message")
+			.catch(error => {
+				rejected = error;
+			})
+			.finally(() => {
+				settled = true;
+			});
+
+		try {
+			await waitFor(() => session.isStreaming || settled);
+			if (rejected) throw rejected;
+
+			expect(session.isStreaming).toBe(true);
+			expect(settled).toBe(false);
+			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		} finally {
+			await session.abort();
+			await turn;
+		}
 	});
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
@@ -1122,6 +1205,165 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+	});
+
+	it("marks extension agent_end willContinue for TTSR abort and not ordinary abort", async () => {
+		collapseSchedulerSettleDelays();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+
+		const extensionEmits: Array<{ type: string; willContinue?: boolean }> = [];
+		const continuationStarted = Promise.withResolvers<void>();
+
+		let streamCallCount = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				const signal = options?.signal;
+				if (streamCallCount === 1) {
+					pushAbortableTtsrStream(stream, signal);
+				} else {
+					pushContinuationStream(stream, () => continuationStarted.resolve());
+				}
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"todo.reminders": false,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-will-continue.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_end", event => {
+					extensionEmits.push({ type: event.type, willContinue: event.willContinue });
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"capture-agent-end",
+		);
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			ttsrManager,
+			extensionRunner,
+		});
+
+		const firstGoalEndStarted = Promise.withResolvers<void>();
+		const releaseFirstGoalEnd = Promise.withResolvers<void>();
+		let goalEndCalls = 0;
+		vi.spyOn(GoalRuntime.prototype, "onAgentEnd").mockImplementation(async () => {
+			goalEndCalls++;
+			if (goalEndCalls !== 1) return;
+			firstGoalEndStarted.resolve();
+			await releaseFirstGoalEnd.promise;
+		});
+
+		const ttsrPrompt = session.prompt("Write some Rust code");
+		await firstGoalEndStarted.promise;
+		await continuationStarted.promise;
+		const pendingClearedWhileMaintenanceBlocked = !session.isTtsrAbortPending;
+		releaseFirstGoalEnd.resolve();
+		await ttsrPrompt;
+		await session.waitForIdle();
+		expect(pendingClearedWhileMaintenanceBlocked).toBe(true);
+
+		const ttsrEnds = extensionEmits.filter(event => event.type === "agent_end");
+		expect(streamCallCount).toBeGreaterThanOrEqual(2);
+		// Intermediate TTSR-abort settle continues; terminal settle after retry does not.
+		expect(ttsrEnds.length).toBeGreaterThanOrEqual(2);
+		expect(ttsrEnds[0]?.willContinue).toBe(true);
+		expect(ttsrEnds.slice(1, -1).every(event => !event.willContinue)).toBe(true);
+		expect(ttsrEnds.at(-1)?.willContinue).toBeFalsy();
+
+		extensionEmits.length = 0;
+		const ordinaryAgent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				const signal = options?.signal;
+				queueMicrotask(() => {
+					const partial = makeMsg("partial");
+					stream.push({ type: "start", partial });
+					stream.push({
+						type: "text_delta",
+						contentIndex: 0,
+						delta: "partial",
+						partial: makeMsg("partial"),
+					});
+					queueMicrotask(() => {
+						session?.agent.abort("user cancelled");
+					});
+					if (signal) {
+						signal.addEventListener(
+							"abort",
+							() => {
+								stream.push({
+									type: "error",
+									reason: "aborted",
+									error: makeMsg("partial", "aborted"),
+								});
+							},
+							{ once: true },
+						);
+					}
+				});
+				return stream;
+			},
+		});
+		await session.dispose();
+		session = new AgentSession({
+			agent: ordinaryAgent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		const promptPromise = session.prompt("user will cancel");
+		await session.waitForIdle();
+		await promptPromise.catch(() => undefined);
+
+		const ordinaryEnds = extensionEmits.filter(event => event.type === "agent_end");
+		expect(ordinaryEnds.length).toBeGreaterThanOrEqual(1);
+		for (const event of ordinaryEnds) {
+			expect(event.willContinue).toBeFalsy();
+		}
 	});
 
 	it("labels aborted tool placeholders with the TTSR rule reason", async () => {

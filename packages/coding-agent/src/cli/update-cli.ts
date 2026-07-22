@@ -2,9 +2,10 @@
  * Update CLI command handler.
  *
  * Handles `rtx update` to check for and install updates.
- * Downloads and installs the matching rtx binary from this fork's GitHub releases.
+ * Uses the installer that owns the active rtx executable when it can be detected.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
@@ -12,7 +13,6 @@ import { $ } from "bun";
 import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
-import { fetchLatestRtxRelease, type RtxReleaseInfo } from "./rtx-release";
 
 const REPO = "therealtimex/rtx";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
@@ -30,6 +30,7 @@ const MISE_TOOL = "github:can1357/oh-my-pi";
  * See #1686.
  */
 const NPM_REGISTRY = "https://registry.npmjs.org/";
+const RELEASE_METADATA_TIMEOUT_MS = 30_000;
 const BINARY_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 
 /**
@@ -57,6 +58,11 @@ const SUPPORTED_NATIVE_TAGS: ReadonlySet<string> = new Set([
 
 function currentNativeTag(): string {
 	return `${process.platform}-${process.arch}`;
+}
+
+interface ReleaseInfo {
+	tag: string;
+	version: string;
 }
 
 /** Result from running the installed binary and parsing its reported version. */
@@ -91,6 +97,71 @@ export function parseUpdateArgs(args: string[]): { force: boolean; check: boolea
 	};
 }
 
+async function getBunGlobalBinDir(): Promise<string | undefined> {
+	if (!$which("bun")) return undefined;
+	try {
+		const result = await $`bun pm bin -g`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		const output = result.text().trim();
+		return output.length > 0 ? output : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function getNpmGlobalBinDir(): Promise<string | undefined> {
+	if (!$which("npm")) return undefined;
+	try {
+		const result = await $`npm prefix -g`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		const prefix = result.text().trim();
+		if (prefix.length === 0) return undefined;
+		return process.platform === "win32" ? prefix : path.join(prefix, "bin");
+	} catch {
+		return undefined;
+	}
+}
+
+async function getHomebrewFormulaPrefix(): Promise<string | undefined> {
+	if (!$which("brew")) return undefined;
+	for (const formula of [HOMEBREW_FORMULA, APP_NAME]) {
+		try {
+			const result = await $`brew --prefix ${formula}`.quiet().nothrow();
+			if (result.exitCode !== 0) continue;
+			const output = result.text().trim();
+			if (output.length > 0) return output;
+		} catch {}
+	}
+	return undefined;
+}
+
+async function getMiseBinDirs(): Promise<string[]> {
+	if (!$which("mise")) return [];
+	try {
+		const result = await $`mise bin-paths ${MISE_TOOL}`.quiet().nothrow();
+		if (result.exitCode !== 0) return [];
+		return result
+			.text()
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0);
+	} catch {
+		return [];
+	}
+}
+
+function getMiseDataDir(): string {
+	const override = process.env.MISE_DATA_DIR;
+	if (override && override.length > 0) return override;
+	if (process.platform === "win32") {
+		const localAppData = process.env.LOCALAPPDATA;
+		if (localAppData && localAppData.length > 0) return path.join(localAppData, "mise");
+	}
+	const xdgDataHome = process.env.XDG_DATA_HOME;
+	if (xdgDataHome && xdgDataHome.length > 0) return path.join(xdgDataHome, "mise");
+	return path.join(os.homedir(), ".local", "share", "mise");
+}
+
 function normalizePathForComparison(filePath: string): string {
 	const normalized = path.normalize(filePath);
 	if (process.platform === "win32") return normalized.toLowerCase();
@@ -116,10 +187,10 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	if (isPathInDirectoryLexical(filePath, directoryPath)) return true;
 	// Layer realpath resolution on top of the lexical guard. On Windows, ~/.bun
 	// is a junction when Bun is installed via Scoop, so `bun pm bin -g` and the
-	// PATH-resolved omp path can refer to the same directory through different
+	// PATH-resolved rtx path can refer to the same directory through different
 	// strings. path.resolve does not traverse junctions/symlinks; realpath does.
 	// Resolve both the file and its parent directory: the file catches manager
-	// links like Homebrew's `bin/omp -> Cellar/.../bin/omp`; the parent fallback
+	// links like Homebrew's `bin/rtx -> Cellar/.../bin/rtx`; the parent fallback
 	// still tolerates fresh install paths where the file does not exist yet.
 	const dirReal = tryRealpath(path.resolve(directoryPath));
 	if (!dirReal) return false;
@@ -131,24 +202,36 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "binary";
+type UpdateMethod = "brew" | "mise" | "bun" | "npm" | "binary";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
 	miseBinDirs?: readonly string[];
 	miseDataDir?: string;
+	npmBinDir?: string;
 }
+
+type UpdateTarget =
+	| { method: "brew" }
+	| { method: "mise" }
+	| { method: "bun" }
+	| { method: "npm" }
+	| { method: "binary"; path: string };
 
 function resolveUpdateMethod(
 	ompPath: string,
 	bunBinDir: string | undefined,
 	options: UpdateMethodResolutionOptions = {},
 ): UpdateMethod {
-	const { homebrewPrefix, miseBinDirs = [], miseDataDir } = options;
+	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir } = options;
+	const launcherExtension = path.extname(ompPath).toLowerCase();
+	const isWindowsScriptLauncher =
+		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
 	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir)) return "bun";
+	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir)) || isWindowsScriptLauncher) return "npm";
 	return "binary";
 }
 
@@ -159,17 +242,54 @@ export function resolveUpdateMethodForTest(
 ): UpdateMethod {
 	return resolveUpdateMethod(ompPath, bunBinDir, options);
 }
-/** * Get the latest release info from the GitHub release channel used by this fork.
+async function resolveUpdateTarget(): Promise<UpdateTarget> {
+	const bunBinDir = await getBunGlobalBinDir();
+	const npmBinDir = await getNpmGlobalBinDir();
+	const homebrewPrefix = await getHomebrewFormulaPrefix();
+	const miseAvailable = $which("mise") !== undefined;
+	const miseBinDirs = miseAvailable ? await getMiseBinDirs() : [];
+	const miseDataDir = miseAvailable ? getMiseDataDir() : undefined;
+	const ompPath = resolveOmpPath();
+
+	if (ompPath) {
+		const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir, npmBinDir });
+		if (method === "binary") return { method, path: ompPath };
+		return { method };
+	}
+
+	if (bunBinDir) return { method: "bun" };
+
+	throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
+}
+
+/**
+ * Get the latest release info from the npm registry.
+ * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
  */
-async function getLatestRelease(): Promise<RtxReleaseInfo> {
+async function getLatestRelease(): Promise<ReleaseInfo> {
+	let response: Response;
 	try {
-		return await fetchLatestRtxRelease();
+		response = await fetch(`${NPM_REGISTRY}${PACKAGE}/latest`, {
+			signal: withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS),
+		});
 	} catch (err) {
 		if (isTimeoutError(err)) {
 			throw new Error("Timed out fetching release info after 30s", { cause: err });
 		}
 		throw err;
 	}
+	if (!response.ok) {
+		throw new Error(`Failed to fetch release info: ${response.statusText}`);
+	}
+
+	const data = (await response.json()) as { version: string };
+	const version = data.version;
+	const tag = `v${version}`;
+
+	return {
+		tag,
+		version,
+	};
 }
 
 /**
@@ -347,7 +467,7 @@ async function removeCacheEntries(paths: string[]): Promise<number> {
  *
  * Bun stores package cache entries as both a package marker directory
  * (`react/19.2.6@@@1`) and a materialized package directory
- * (`react@19.2.6@@@1`). Global `omp` updates can leave one full copy per
+ * (`react@19.2.6@@@1`). Global `rtx` updates can leave one full copy per
  * release. The marker and materialized entries are removed together so the
  * cache stays internally consistent.
  */
@@ -376,6 +496,17 @@ export async function pruneBunInstallCache(
 	return { scannedPackages, removedEntries };
 }
 
+async function resolveBunInstallCacheDir(): Promise<string | undefined> {
+	try {
+		const result = await $`bun pm cache`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		const output = result.text().trim();
+		return output.length > 0 ? output : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function resolveBunGlobalNodeModulesDirFromLocations(
 	globalBinDir: string | undefined,
 	cacheDir: string | undefined,
@@ -387,6 +518,42 @@ export function resolveBunGlobalNodeModulesDirFromLocations(
 		return path.join(path.dirname(cacheDir), "global", "node_modules");
 	}
 	return undefined;
+}
+
+async function resolveBunGlobalNodeModulesDir(cacheDir: string): Promise<string | undefined> {
+	try {
+		const result = await $`bun pm bin -g`.quiet().nothrow();
+		const globalBinDir = result.exitCode === 0 ? result.text().trim() : undefined;
+		return resolveBunGlobalNodeModulesDirFromLocations(globalBinDir, cacheDir);
+	} catch {
+		return resolveBunGlobalNodeModulesDirFromLocations(undefined, cacheDir);
+	}
+}
+
+async function collectInstalledPackageNames(nodeModulesDir: string): Promise<Set<string>> {
+	const packageNames = new Set<string>();
+	for (const entry of await readdirIfExists(nodeModulesDir)) {
+		if (!entry.isDirectory() || entry.name === ".bin") continue;
+		if (entry.name.startsWith("@")) {
+			for (const scopedEntry of await readdirIfExists(path.join(nodeModulesDir, entry.name))) {
+				if (scopedEntry.isDirectory()) packageNames.add(`${entry.name}/${scopedEntry.name}`);
+			}
+			continue;
+		}
+		packageNames.add(entry.name);
+	}
+	return packageNames;
+}
+
+async function pruneBunCacheAfterGlobalInstall(): Promise<BunInstallCachePruneResult | undefined> {
+	const cacheDir = await resolveBunInstallCacheDir();
+	if (!cacheDir) return undefined;
+	const globalNodeModulesDir = await resolveBunGlobalNodeModulesDir(cacheDir);
+	const packageNames = globalNodeModulesDir
+		? await collectInstalledPackageNames(globalNodeModulesDir)
+		: new Set<string>();
+	if (packageNames.size === 0 && !path.basename(cacheDir).toLowerCase().includes("omp")) return undefined;
+	return await pruneBunInstallCache(cacheDir, packageNames.size === 0 ? undefined : packageNames);
 }
 
 /**
@@ -432,7 +599,7 @@ function getBinaryName(): string {
 /**
  * Resolve the path that `rtx` maps to in the user's PATH.
  */
-function resolveRtxPath(): string | undefined {
+function resolveOmpPath(): string | undefined {
 	return $which(APP_NAME) ?? undefined;
 }
 
@@ -440,18 +607,18 @@ function resolveRtxPath(): string | undefined {
  * Run the resolved rtx binary and check if it reports the expected version.
  */
 async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const rtxPath = resolveRtxPath();
-	if (!rtxPath) return { ok: false };
+	const ompPath = resolveOmpPath();
+	if (!ompPath) return { ok: false };
 	try {
-		const result = await $`${rtxPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: rtxPath };
+		const result = await $`${ompPath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return { ok: false, path: ompPath };
 		const output = result.text().trim();
 		// Output format: "rtx/X.Y.Z"
 		const match = output.match(/\/(\d+\.\d+\.\d+)/);
 		const actual = match?.[1];
-		return { ok: actual === expectedVersion, actual, path: rtxPath };
+		return { ok: actual === expectedVersion, actual, path: ompPath };
 	} catch {
-		return { ok: false, path: rtxPath };
+		return { ok: false, path: ompPath };
 	}
 }
 
@@ -464,6 +631,19 @@ function formatVerificationFailure(result: InstalledVersionVerification, expecte
 		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
 	}
 	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
+}
+
+/**
+ * Print post-update verification result.
+ */
+async function printVerification(expectedVersion: string): Promise<void> {
+	const result = await verifyInstalledVersion(expectedVersion);
+	if (result.ok) {
+		printVerifiedVersion(expectedVersion);
+		return;
+	}
+	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
+	console.log(chalk.yellow(`You may need to reinstall from https://github.com/${REPO}/releases`));
 }
 
 async function unlinkIfExists(filePath: string): Promise<void> {
@@ -559,8 +739,16 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
+function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: string): string[] {
+	const args = [`${PACKAGE}@${expectedVersion}`, `${NATIVES_PACKAGE}@${expectedVersion}`];
+	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
+		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
+	}
+	return args;
+}
+
 /**
- * Build the bun argv used to globally install a specific omp version.
+ * Build the bun argv used to globally install a specific rtx version.
  *
  * The version is selected by hitting {@link NPM_REGISTRY} directly in
  * {@link getLatestRelease}, so the install MUST observe the same catalog:
@@ -572,7 +760,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * - `--no-cache` tells bun to ignore its on-disk manifest snapshot so it
  *   re-fetches metadata from that registry on every invocation.
  *
- * Together these two flags make `omp update` produce exactly the registry
+ * Together these two flags make `rtx update` produce exactly the registry
  * lookup the version check just performed. See #1686.
  *
  * Also pins {@link NATIVES_PACKAGE} and the platform-specific
@@ -590,17 +778,23 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * See #1824.
  */
 export function buildBunInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
-	const args = [
+	return [
 		"install",
 		"-g",
 		"--no-cache",
 		`--registry=${NPM_REGISTRY}`,
-		`${PACKAGE}@${expectedVersion}`,
-		`${NATIVES_PACKAGE}@${expectedVersion}`,
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
 	];
-	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
-	}
+}
+
+/** Build the npm argv used to update npm-managed global installs. */
+export function buildNpmInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
+	const args = [
+		"install",
+		"-g",
+		`--registry=${NPM_REGISTRY}`,
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+	];
 	return args;
 }
 
@@ -614,6 +808,75 @@ export function buildMiseUpgradeArgs(): string[] {
 
 export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 	return ["install", "--force", `${MISE_TOOL}@${expectedVersion}`];
+}
+
+/**
+ * Update via package manager.
+ */
+async function updateViaBun(expectedVersion: string): Promise<void> {
+	console.log(chalk.dim("Updating via bun..."));
+	const args = buildBunInstallArgs(expectedVersion);
+	const result = await $`bun ${args}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`bun install failed with exit code ${result.exitCode}`);
+	}
+
+	await printVerification(expectedVersion);
+	try {
+		const pruneResult = await pruneBunCacheAfterGlobalInstall();
+		if (pruneResult && pruneResult.removedEntries > 0) {
+			console.log(chalk.dim(`Pruned ${pruneResult.removedEntries} stale Bun cache entries`));
+		}
+	} catch (err) {
+		console.log(chalk.yellow(`Warning: could not prune stale Bun cache entries: ${err}`));
+	}
+}
+
+async function updateViaNpm(expectedVersion: string): Promise<void> {
+	console.log(chalk.dim("Updating via npm..."));
+	const args = buildNpmInstallArgs(expectedVersion);
+	const result = await $`npm ${args}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`npm install failed with exit code ${result.exitCode}`);
+	}
+
+	await printVerification(expectedVersion);
+}
+
+async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
+	console.log(chalk.dim("Updating Homebrew formulae..."));
+	const update = await $`brew update`.nothrow();
+	if (update.exitCode !== 0) {
+		throw new Error(`brew update failed with exit code ${update.exitCode}`);
+	}
+
+	console.log(chalk.dim("Updating via Homebrew..."));
+	const args = buildHomebrewUpdateArgs(force);
+	const result = await $`brew ${args}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`brew ${args[0]} failed with exit code ${result.exitCode}`);
+	}
+
+	await printVerification(expectedVersion);
+}
+
+async function updateViaMise(expectedVersion: string, force: boolean): Promise<void> {
+	console.log(chalk.dim("Updating via mise..."));
+	const args = buildMiseUpgradeArgs();
+	const result = await $`mise ${args}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`mise upgrade failed with exit code ${result.exitCode}`);
+	}
+
+	if (force) {
+		const forceArgs = buildMiseForceInstallArgs(expectedVersion);
+		const forceResult = await $`mise ${forceArgs}`.nothrow();
+		if (forceResult.exitCode !== 0) {
+			throw new Error(`mise install --force failed with exit code ${forceResult.exitCode}`);
+		}
+	}
+
+	await printVerification(expectedVersion);
 }
 
 /**
@@ -671,7 +934,7 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
 	// Check for updates
-	let release: RtxReleaseInfo;
+	let release: ReleaseInfo;
 	try {
 		release = await getLatestRelease();
 	} catch (err) {
@@ -697,17 +960,22 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		return;
 	}
 
+	// Choose update method based on the prioritized rtx binary in PATH
 	try {
-		const targetPath = resolveRtxPath();
-		if (!targetPath) throw new Error(`Could not resolve ${APP_NAME} binary path in PATH`);
-		await updateViaBinaryAt(targetPath, release.version);
+		const target = await resolveUpdateTarget();
+		if (target.method === "brew") {
+			await updateViaHomebrew(release.version, opts.force);
+		} else if (target.method === "mise") {
+			await updateViaMise(release.version, opts.force);
+		} else if (target.method === "bun") {
+			await updateViaBun(release.version);
+		} else if (target.method === "npm") {
+			await updateViaNpm(release.version);
+		} else {
+			await updateViaBinaryAt(target.path, release.version);
+		}
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
-		console.error(
-			chalk.yellow(
-				`Reinstall with: curl -fsSL https://raw.githubusercontent.com/therealtimex/rtx/main/scripts/install.sh | sh`,
-			),
-		);
 		process.exit(1);
 	}
 }

@@ -46,31 +46,65 @@ export const commands: CommandEntry[] = [
 	{ name: "search", load: () => import("./commands/web-search").then(m => m.default), aliases: ["q"] },
 ];
 
-// Documented-looking plugin-management verbs that are NOT registered top-level
-// commands. Without a guard `resolveCliArgv` rewrites e.g. `omp list` to
-// `omp launch list`, silently forwarding the bare verb to the model as a prompt
-// instead of managing plugins (#2935; same class as the `install` leak fixed in
-// #1496/#1498). A bare (single-arg) use gets a hint pointing at the real
-// `omp plugin <action>` command; multi-word invocations still fall through to
-// `launch`, so genuine prompts that merely begin with one of these words work.
-const RESERVED_TOP_LEVEL_WORDS = new Map<string, string>([
-	[
-		"extensions",
+// Documented-looking plugin/marketplace verbs that are NOT registered top-level
+// commands. Without a guard `resolveCliArgv` rewrites e.g. `rtx marketplace add
+// xyz` to `rtx launch marketplace add xyz`, silently forwarding the argv to the
+// model as a prompt instead of managing plugins (#4845; same class as the
+// `list`/`remove` leak fixed in #2935 and the `install` leak in #1496/#1498).
+// The real commands live under `rtx plugin <action>`; each entry maps a verb to
+// a hint pointing there. See {@link reservedTopLevelWordMessage} for when a hint
+// fires vs. when the argv still falls through to `launch`.
+const RESERVED_TOP_LEVEL_WORDS: Record<string, string> = {
+	extensions:
 		'`rtx extensions` is not a management command. Use `rtx plugin list` / `rtx plugin install`, or run `rtx launch extensions` if you meant to send "extensions" as a prompt.',
-	],
-	[
-		"list",
-		'`omp list` is not a top-level command. Use `omp plugin list` to list installed plugins, or run `omp launch list` if you meant to send "list" as a prompt.',
-	],
-	[
-		"remove",
-		'`omp remove` is not a top-level command. Use `omp plugin uninstall <name>` to remove a plugin, or run `omp launch remove` if you meant to send "remove" as a prompt.',
-	],
-]);
+	list: '`rtx list` is not a top-level command. Use `rtx plugin list` to list installed plugins, or run `rtx launch list` if you meant to send "list" as a prompt.',
+	remove:
+		'`rtx remove` is not a top-level command. Use `rtx plugin uninstall <name>` to remove a plugin, or run `rtx launch remove` if you meant to send "remove" as a prompt.',
+	uninstall:
+		'`rtx uninstall` is not a top-level command. Use `rtx plugin uninstall <name@marketplace>` to remove a plugin, or run `rtx launch uninstall` if you meant to send "uninstall" as a prompt.',
+	marketplace:
+		'`rtx marketplace` is not a top-level command. Use `rtx plugin marketplace <add|remove|update|list>` to manage marketplaces, or run `rtx launch marketplace` if you meant to send "marketplace" as a prompt.',
+	discover:
+		'`rtx discover` is not a top-level command. Use `rtx plugin discover [marketplace]` to browse available plugins, or run `rtx launch discover` if you meant to send "discover" as a prompt.',
+	upgrade:
+		'`rtx upgrade` is not a top-level command. Use `rtx plugin upgrade [name@marketplace]` to upgrade plugins, or run `rtx launch upgrade` if you meant to send "upgrade" as a prompt.',
+	enable:
+		'`rtx enable` is not a top-level command. Use `rtx plugin enable <name@marketplace>` to enable a plugin, or run `rtx launch enable` if you meant to send "enable" as a prompt.',
+	disable:
+		'`rtx disable` is not a top-level command. Use `rtx plugin disable <name@marketplace>` to disable a plugin, or run `rtx launch disable` if you meant to send "disable" as a prompt.',
+};
 
-export function reservedTopLevelWordMessage(first: string | undefined, argc = 1): string | undefined {
-	if (argc !== 1 || !first || first.startsWith("-") || first.startsWith("@")) return undefined;
-	return RESERVED_TOP_LEVEL_WORDS.get(first);
+// Sub-actions that make `rtx marketplace <sub>` unambiguously a management
+// command even when multi-word (the reporter's `rtx marketplace add xyz`,
+// #4845). Mirrors the switch in `handleMarketplace` (cli/plugin-cli.ts).
+const MARKETPLACE_SUBCOMMANDS: Record<string, true> = { add: true, remove: true, rm: true, update: true, list: true };
+
+/**
+ * Hint for a reserved plugin/marketplace verb used as a top-level command, or
+ * `undefined` when the argv should fall through to `launch`.
+ *
+ * A bare verb (`rtx marketplace`) always hints. A multi-word invocation only
+ * hints when the arguments follow the documented plugin grammar — a marketplace
+ * sub-action (`rtx marketplace add ...`) or a `name@marketplace` plugin id
+ * (`rtx uninstall foo@bar`) — so genuine prompts that merely begin with one of
+ * these words (`rtx list all my files`, `rtx upgrade the deps`) still launch.
+ *
+ * Flags (`-…`) and `@file` arguments in the verb slot are never management
+ * commands; those fall through to the default `launch` command.
+ */
+export function reservedTopLevelWordMessage(argv: readonly string[]): string | undefined {
+	const first = argv[0];
+	if (!first || first.startsWith("-") || first.startsWith("@")) return undefined;
+	const hint = RESERVED_TOP_LEVEL_WORDS[first];
+	if (!hint) return undefined;
+	const second = argv[1];
+	if (second === undefined) return hint;
+	if (first === "marketplace" && MARKETPLACE_SUBCOMMANDS[second]) return hint;
+	for (let index = 1; index < argv.length; index += 1) {
+		const arg = argv[index];
+		if (!arg.startsWith("-") && arg.includes("@")) return hint;
+	}
+	return undefined;
 }
 
 /**
@@ -112,14 +146,14 @@ function leadingSubcommandIndex(argv: string[]): number {
  */
 export function resolveCliArgv(argv: string[]): ResolvedCliArgv {
 	const first = argv[0];
-	const reservedMessage = reservedTopLevelWordMessage(first, argv.length);
+	const reservedMessage = reservedTopLevelWordMessage(argv);
 	if (reservedMessage) return { error: reservedMessage };
 	if (first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help") {
 		return { argv };
 	}
 	if (isSubcommand(first)) return { argv };
 	// A subcommand can hide behind leading global option flags
-	// (`omp --approval-mode=yolo acp`). `run` dispatches strictly on argv[0], so
+	// (`rtx --approval-mode=yolo acp`). `run` dispatches strictly on argv[0], so
 	// hoist the subcommand to the front and keep the leading flags as its own
 	// argv; the command's parser then applies them. Genuine launch prompts (no
 	// trailing subcommand) are untouched.

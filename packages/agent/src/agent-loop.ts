@@ -40,6 +40,7 @@ import {
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
 	type AgentTelemetry,
@@ -66,6 +67,9 @@ import type {
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
+	SoftToolRequirement,
+	SteeringInterruptSource,
+	SteeringQueueState,
 	StreamFn,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
@@ -132,6 +136,13 @@ export function createToolScopedAbortReason(
 	return { kind: "tool-scoped-abort", message, toolCallMessages, defaultToolCallMessage };
 }
 
+/**
+ * Marks an abort raised by a completed post-tool hook as terminal for the
+ * current run. External/user aborts still synthesize an aborted assistant
+ * boundary; this reason stops after persisting the completed tool batch.
+ */
+export const TERMINAL_TOOL_RESULT_ABORT_REASON = Symbol.for("pi-agent-core.terminal-tool-result");
+
 const STEERING_INTERRUPT_POLL_MS = 250;
 
 class HarmonyLeakInterruption extends Error {
@@ -172,6 +183,7 @@ type AssistantToolCallBlock = Extract<AssistantContentBlock, { type: "toolCall" 
 function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantContentBlock {
 	switch (block.type) {
 		case "text":
+		case "image":
 			return { ...block };
 		case "thinking":
 			return { ...block };
@@ -213,6 +225,7 @@ function snapshotAssistantMessageEvent(
 		case "text_start":
 		case "text_delta":
 		case "text_end":
+		case "image_end":
 		case "thinking_start":
 		case "thinking_delta":
 		case "thinking_end":
@@ -756,12 +769,13 @@ async function runLoopBody(
 	let deadlineTimer: Timer | undefined;
 	if (config.deadline !== undefined) {
 		const deadlineAbortController = new AbortController();
+		const deadlineReason = new DOMException("Deadline exceeded", "TimeoutError");
 		const delay = config.deadline - Date.now();
 		if (delay <= 0) {
-			deadlineAbortController.abort("Deadline exceeded");
+			deadlineAbortController.abort(deadlineReason);
 		} else {
 			deadlineTimer = setTimeout(() => {
-				deadlineAbortController.abort("Deadline exceeded");
+				deadlineAbortController.abort(deadlineReason);
 			}, delay);
 		}
 		signal = signal ? AbortSignal.any([signal, deadlineAbortController.signal]) : deadlineAbortController.signal;
@@ -792,6 +806,7 @@ async function runLoopBody(
 		// getToolChoice is never advanced twice; the flag resets at the message boundary.
 		let hostToolChoice: ToolChoice | undefined;
 		let softRequiredTool: string | undefined;
+		let softSatisfies: SoftToolRequirement["satisfies"];
 		let directiveResolvedForTurn = false;
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -807,6 +822,10 @@ async function runLoopBody(
 				// Yield at the top of each iteration to prevent busy-wait when
 				// the agent loop is executing tool calls back-to-back.
 				await yieldIfDue();
+				// Park at the turn boundary while the process-wide pause gate is
+				// engaged (host /pause). An external abort releases the park so a
+				// cancelled run still unwinds while everything else stays frozen.
+				if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(signal);
 				if (!firstTurn) {
 					stream.push({ type: "turn_start" });
 				} else {
@@ -846,6 +865,7 @@ async function runLoopBody(
 					const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 					hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
 					softRequiredTool = softReq?.toolName;
+					softSatisfies = softReq?.satisfies;
 					if (softReq !== undefined) {
 						if (softReq.id !== softRequirementId) {
 							softRequirementId = softReq.id;
@@ -1009,7 +1029,7 @@ async function runLoopBody(
 				const calledOnlyRequiredTool =
 					softRequiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => toolCall.name === softRequiredTool);
+					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
 				const softGateActive =
 					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
 				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
@@ -1082,6 +1102,12 @@ async function runLoopBody(
 					if (message.stopReason === "length" && toolResults.length > 0 && !deadlinePassed) {
 						hasMoreToolCalls = true;
 					}
+				}
+
+				// A tool hook may mark its completed result as terminal (e.g. subagent yield).
+				// Stop before the next provider call without changing external/user abort semantics.
+				if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON) {
+					hasMoreToolCalls = false;
 				}
 
 				if (toolCalls.length > 0) {
@@ -1501,6 +1527,7 @@ async function streamAssistantResponse(
 						case "text_start":
 						case "text_delta":
 						case "text_end":
+						case "image_end":
 						case "thinking_start":
 						case "thinking_delta":
 						case "thinking_end":
@@ -1787,7 +1814,7 @@ async function executeToolCalls(
 	const interruptibleSignal: AbortSignal = signal
 		? AbortSignal.any([signal, steeringAbortController.signal, ircAbortController.signal])
 		: AbortSignal.any([steeringAbortController.signal, ircAbortController.signal]);
-	const interruptState = { triggered: false };
+	const interruptState: { triggered: boolean; source?: SteeringInterruptSource | "irc" } = { triggered: false };
 
 	const records = toolCalls.map(toolCall => {
 		// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
@@ -1797,11 +1824,25 @@ async function executeToolCalls(
 		const tool =
 			tools?.find(t => t.name === toolCall.name) ??
 			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name);
+		const args = toolCall.arguments as Record<string, unknown>;
+		const interruptibleMode = tool?.interruptible;
+		let interruptible = false;
+		if (typeof interruptibleMode === "function") {
+			try {
+				interruptible = interruptibleMode(args);
+			} catch {
+				// Resolver failures default to preserving the tool's outcome.
+				interruptible = false;
+			}
+		} else {
+			interruptible = interruptibleMode === true;
+		}
 		return {
 			toolCall,
 			tool,
-			args: toolCall.arguments as Record<string, unknown>,
-			signal: tool?.interruptible ? interruptibleSignal : nonInterruptibleSignal,
+			args,
+			interruptible,
+			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
 			result: undefined as AgentToolResult<any> | undefined,
 			isError: false,
@@ -1822,15 +1863,25 @@ async function executeToolCalls(
 		// integration only provides getSteeringMessages(), the queue drains at the
 		// injection boundary below; polling it here would strand or drop messages.
 		let steeringQueued = false;
+		let steeringSource: SteeringInterruptSource | undefined;
 		if (hasSteeringMessages) {
-			steeringQueued = await hasSteeringMessages();
+			const queuedState = await hasSteeringMessages();
+			if (typeof queuedState === "boolean") {
+				steeringQueued = queuedState;
+				steeringSource = queuedState ? "user" : undefined;
+			} else {
+				const state: SteeringQueueState = queuedState;
+				steeringQueued = state.queued;
+				steeringSource = state.source ?? (state.queued ? "unknown" : undefined);
+			}
 		}
 		if (steeringQueued) {
-			// User steering upgrades an in-flight IRC interrupt: it aborts the
+			// Queued steering upgrades an in-flight IRC interrupt: it aborts the
 			// shared signal so foreground tools stop as they do for a user Esc.
 			// Idempotent — a second steer poll after the abort is a no-op.
 			if (!steeringAbortController.signal.aborted) {
 				interruptState.triggered = true;
+				interruptState.source = steeringSource ?? "unknown";
 				steeringAbortController.abort();
 			}
 			return;
@@ -1842,6 +1893,7 @@ async function executeToolCalls(
 			// Peer IRC only aborts interruptible waits: a foreground bash / write
 			// mid-execution keeps running so we never leave partial side effects.
 			interruptState.triggered = true;
+			interruptState.source = "irc";
 			ircAbortController.abort();
 		}
 	};
@@ -1896,6 +1948,10 @@ async function executeToolCalls(
 			record.skipped = true;
 			return;
 		}
+		// Park before starting this tool while the process-wide pause gate is
+		// engaged. Tools already executing are unaffected (pausing never aborts);
+		// a batch interrupted mid-pause unwinds via the signal checks below.
+		if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(record.signal);
 
 		const { toolCall, tool } = record;
 		let argsForExecution = toolCall.arguments as Record<string, unknown>;
@@ -2097,19 +2153,21 @@ async function executeToolCalls(
 
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
-		const abortedDuringExecution = perToolAborted && isError;
-		if (interrupted && perToolAborted && isError) {
-			// This tool's own signal fired AND it failed — it was cut off before producing
-			// a usable result, so report it as skipped.
+		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
+		if (interrupted && perToolAborted && isError && !completedToolExecution) {
+			// This tool's own signal fired AND it failed to produce a result: `tool.execute()`
+			// never returned (it threw on the abort), so it was genuinely cut off before
+			// producing usable output. Report it as skipped.
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(), true);
+			emitToolResult(record, createSkippedToolResult(interruptState.source), true);
 		} else {
-			// No interrupt on this signal, or the tool finished (successfully or with a
-			// genuine error) before the interrupt landed. Keep its real result: a completed
-			// tool already ran its side effects, so the model must see what actually
-			// happened rather than a false "skipped". A peer-IRC interrupt on the batch
-			// leaves non-interruptible tools' signals untouched — their genuine errors
-			// survive here instead of being clobbered into "skipped".
+			// No interrupt on this signal, or the tool finished before the interrupt landed
+			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
+			// its real result: a completed tool already ran its side effects, so the model must
+			// see what actually happened (a genuine non-zero exit / error result) rather than a
+			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
+			// on the batch leaves non-interruptible tools' signals untouched — their genuine
+			// errors survive here too.
 			emitToolResult(record, result, isError);
 		}
 
@@ -2166,16 +2224,16 @@ async function executeToolCalls(
 		}
 	}
 
-	// While an interruptible tool is in flight (e.g. a `job`/`irc` wait
-	// blocking on external work), queued steering or interrupting IRC would
-	// otherwise wait out the tool's own window. Poll only non-consuming queues
-	// and abort the shared tool signal so the boundary dequeue below injects
-	// the message promptly. Gated on immediate-interrupt mode + an
-	// interruptible tool; checkSteering is idempotent (no-op once triggered).
+	// While an interruptible tool call is in flight (e.g. a `hub` wait blocking
+	// on external work), queued steering or interrupting IRC would otherwise
+	// wait out the tool's own window. Poll only non-consuming queues and abort
+	// the shared tool signal so the boundary dequeue below injects the message
+	// promptly. Gated on immediate-interrupt mode + an interruptible call;
+	// checkSteering is idempotent (no-op once triggered).
 	const watchSteeringWhileRunning =
 		shouldInterruptImmediately &&
 		(hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined) &&
-		records.some(r => r.tool?.interruptible === true);
+		records.some(record => record.interruptible);
 	const steeringWatchTimer = watchSteeringWhileRunning
 		? setInterval(() => void checkSteering(), STEERING_INTERRUPT_POLL_MS)
 		: undefined;
@@ -2196,7 +2254,7 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(), true);
+			emitToolResult(record, createSkippedToolResult(interruptState.source), true);
 		}
 	}
 
@@ -2248,18 +2306,14 @@ function syntheticDetailsFor(
 }
 
 /**
- * Create a tool result for a tool call that was emitted by the assistant but
- * never invoked locally. Maintains the tool_use / tool_result pairing the
- * provider API requires, and tags {@link SyntheticToolResultDetails} so
- * consumers can distinguish this from a real local tool failure without
- * string-matching the content (#4321).
+ * Create the persisted synthetic result for a tool call that was emitted by
+ * the assistant but never invoked locally.
  */
-function createAbortedToolResult(
+export function createSyntheticToolResultMessage(
 	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
-	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage?: string,
-): ToolResultMessage {
+): ToolResultMessage<SyntheticToolResultDetails> {
 	const message =
 		reason === "aborted"
 			? "Tool execution was aborted"
@@ -2269,9 +2323,31 @@ function createAbortedToolResult(
 					? "Tool call was not executed because the assistant ended its turn"
 					: "Tool call was not executed because the provider stream ended with an error before the tool could run";
 	const details = syntheticDetailsFor(reason, errorMessage);
-	const result: AgentToolResult<SyntheticToolResultDetails> = {
+	return {
+		role: "toolResult",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
 		content: [{ type: "text", text: errorMessage ? `${message}: ${errorMessage}` : `${message}.` }],
 		details,
+		isError: true,
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * Create and emit a tool result for a tool call that was emitted by the
+ * assistant but never invoked locally.
+ */
+function createAbortedToolResult(
+	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	reason: "aborted" | "error" | "skipped" | "length",
+	errorMessage?: string,
+): ToolResultMessage {
+	const toolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	const result: AgentToolResult<SyntheticToolResultDetails> = {
+		content: toolResultMessage.content,
+		details: toolResultMessage.details,
 	};
 
 	stream.push({
@@ -2288,17 +2364,6 @@ function createAbortedToolResult(
 		result,
 		isError: true,
 	});
-
-	const toolResultMessage: ToolResultMessage<SyntheticToolResultDetails> = {
-		role: "toolResult",
-		toolCallId: toolCall.id,
-		toolName: toolCall.name,
-		content: result.content,
-		details,
-		isError: true,
-		timestamp: Date.now(),
-	};
-
 	stream.push({ type: "message_start", message: toolResultMessage });
 	stream.push({ type: "message_end", message: toolResultMessage });
 
@@ -2313,12 +2378,24 @@ function createToolSignalAbortedResult(signal: AbortSignal): AgentToolResult<unk
 	};
 }
 
-function createSkippedToolResult(): AgentToolResult<any> {
+function createSkippedToolResult(source: SteeringInterruptSource | "irc" | undefined): AgentToolResult<any> {
+	let reason = "pending steering message";
+	let blocker = "queued message";
+	if (source === "user") {
+		reason = "queued user message";
+		blocker = "queued message";
+	} else if (source === "system") {
+		reason = "pending system advisory";
+		blocker = "advisory";
+	} else if (source === "irc") {
+		reason = "pending peer interrupt";
+		blocker = "interrupt";
+	}
 	return {
 		content: [
 			{
 				type: "text",
-				text: "Skipped due to queued user message. Do not count this skipped result as completed work or verification. After the queued message is handled on the next step, retry the skipped tool if it is still needed.",
+				text: `Skipped due to ${reason}. Do not count this skipped result as completed work or verification. After the ${blocker} is handled on the next step, retry the skipped tool if it is still needed.`,
 			},
 		],
 		details: {},

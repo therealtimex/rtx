@@ -17,6 +17,7 @@ import {
 	logger,
 	normalizePathForComparison,
 	postmortem,
+	setInteractiveHost,
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils";
@@ -32,6 +33,8 @@ import { applyStartupCwd } from "./cli/startup-cwd";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
+	DEFAULT_PREWALK_TARGET,
+	expandRoleAlias,
 	getModelMatchPreferences,
 	resolveCliModel,
 	resolveModelRoleValue,
@@ -48,15 +51,19 @@ import {
 	resolveActiveProjectRegistryPath,
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
+import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
+import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
+import { createWarpEventBridgeExtension } from "./modes/warp-events";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import {
 	type CreateAgentSessionOptions,
@@ -74,14 +81,15 @@ import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
-import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
+import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
 import {
 	getChangelogPath,
-	getNewEntries,
 	parseChangelog,
+	parseChangelogVersion,
 	readLastChangelogVersion,
+	selectStartupChangelog,
 	writeLastChangelogVersion,
 } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
@@ -92,6 +100,7 @@ type RunRpcMode = (
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
+	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
@@ -127,6 +136,7 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.maxRecursionDepth",
 	"task.disabledAgents",
 	"task.agentModelOverrides",
+	"task.agentPrewalk",
 	// Memory subsystems are off-by-default for RPC/ACP hosts; embedders that want
 	// memory should opt in explicitly through their own settings layer.
 	"memory.backend",
@@ -604,6 +614,11 @@ async function getChangelogForDisplay(parsed: Args): Promise<string | undefined>
 	}
 
 	const lastVersion = await readLastChangelogVersion();
+	const parsedLastVersion = parseChangelogVersion(lastVersion);
+	if (!parsedLastVersion) {
+		await writeLastChangelogVersion(VERSION);
+		return undefined;
+	}
 	if (lastVersion === VERSION) {
 		// Steady state: user already saw the current version's changelog. Skip the file read + parse.
 		return undefined;
@@ -611,21 +626,36 @@ async function getChangelogForDisplay(parsed: Args): Promise<string | undefined>
 
 	const changelogPath = getChangelogPath();
 	const entries = await parseChangelog(changelogPath);
-
-	if (!lastVersion) {
-		if (entries.length > 0) {
-			await writeLastChangelogVersion(VERSION);
-			return entries.map(e => e.content).join("\n\n");
-		}
-	} else {
-		const newEntries = getNewEntries(entries, lastVersion);
-		if (newEntries.length > 0) {
-			await writeLastChangelogVersion(VERSION);
-			return newEntries.map(e => e.content).join("\n\n");
-		}
+	const startupChangelog = selectStartupChangelog(entries, lastVersion, VERSION);
+	if (startupChangelog.persistCurrentVersion) {
+		await writeLastChangelogVersion(VERSION);
+	}
+	if (startupChangelog.markdown) {
+		return startupChangelog.markdown;
 	}
 
 	return undefined;
+}
+
+const SESSION_ID_ARG_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly string[]): void {
+	if (!parsed.continue || parsed.resume || parsed.fork) return;
+
+	let message: string | undefined;
+	if (parsed.unrecognizedFlags.length === 0 && parsed.messages.length === 1) {
+		message = parsed.messages[0]?.trim();
+	} else if (rawArgs) {
+		const continueIndex = rawArgs.findIndex(arg => arg === "--continue" || arg === "-c");
+		message = rawArgs[continueIndex + 1]?.trim();
+	}
+	if (!message || !SESSION_ID_ARG_RE.test(message)) return;
+
+	const messageIndex = parsed.messages.indexOf(message);
+	if (messageIndex === -1) return;
+	parsed.resume = message;
+	parsed.continue = false;
+	parsed.messages.splice(messageIndex, 1);
 }
 
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
@@ -657,6 +687,8 @@ export async function createSessionManager(
 	if (parsed.noSession) {
 		return SessionManager.inMemory();
 	}
+	normalizeContinueSessionArgs(parsed);
+
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
@@ -783,7 +815,8 @@ export function applyResolvedSystemPromptInputs(
 	}
 }
 
-async function buildSessionOptions(
+/** Builds startup session options from parsed CLI flags, scoped models, and resolved session lineage. */
+export async function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
 	sessionManager: SessionManager | undefined,
@@ -814,6 +847,25 @@ async function buildSessionOptions(
 	if (parsed.providerSessionId) {
 		options.providerSessionId = parsed.providerSessionId;
 	}
+	if (parsed.providerPromptCacheKey) {
+		options.providerPromptCacheKey = parsed.providerPromptCacheKey;
+		options.providerPromptCacheKeySource = "explicit";
+	} else {
+		const header = sessionManager?.getHeader();
+		const scopedModelOverride = scopedModels.length > 0 && !parsed.continue && !parsed.resume;
+		const forkCacheShapeChanged =
+			scopedModelOverride ||
+			parsed.model !== undefined ||
+			parsed.thinking !== undefined ||
+			parsed.systemPrompt !== undefined ||
+			parsed.appendSystemPrompt !== undefined ||
+			parsed.tools !== undefined ||
+			parsed.noTools === true;
+		if (!forkCacheShapeChanged && header?.providerPromptCacheKey) {
+			options.providerPromptCacheKey = header.providerPromptCacheKey;
+			options.providerPromptCacheKeySource = "fork";
+		}
+	}
 
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
@@ -824,13 +876,18 @@ async function buildSessionOptions(
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
 			modelRegistry,
+			settings: activeSettings,
 			preferences: modelMatchPreferences,
 		});
 		if (resolved.warning) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
 		}
-		if (resolved.error) {
-			if (!parsed.provider && !parsed.model.includes(":")) {
+		const matchedAfterMissingRolePattern = (resolved.configuredPatternIndex ?? 0) > 0;
+		if (matchedAfterMissingRolePattern) {
+			// Extensions may register an earlier configured role candidate.
+			options.modelPattern = parsed.model;
+		} else if (resolved.error) {
+			if (!parsed.provider && ((resolved.configuredPatterns?.length ?? 0) > 0 || !parsed.model.includes(":"))) {
 				// Model not found in built-in registry — defer resolution to after extensions load
 				// (extensions may register additional providers/models via registerProvider)
 				options.modelPattern = parsed.model;
@@ -875,6 +932,47 @@ async function buildSessionOptions(
 			}
 		}
 		if (!options.model) options.model = scopedModels[0].model;
+	}
+
+	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
+		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
+	}
+	const prewalkEnabled = parsed.noPrewalk
+		? false
+		: parsed.prewalk === true || parsed.prewalkInto !== undefined
+			? true
+			: activeSettings.get("prewalk.enabled");
+	if (prewalkEnabled) {
+		const rolePattern = expandRoleAlias(parsed.prewalkInto ?? DEFAULT_PREWALK_TARGET, activeSettings);
+		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		if (resolved.warning) {
+			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
+		}
+		if (resolved.error || !resolved.model) {
+			throw new Error(resolved.error ?? `Model "${parsed.prewalkInto ?? DEFAULT_PREWALK_TARGET}" not found`);
+		}
+		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
+			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
+		}
+		options.prewalk = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+	}
+
+	if (parsed.planYoloInto !== undefined && !parsed.planYolo) {
+		throw new Error("--plan-yolo-into requires --plan-yolo");
+	}
+	if (parsed.planYolo) {
+		const rolePattern = expandRoleAlias(parsed.planYoloInto ?? "@smol", activeSettings);
+		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		if (resolved.warning) {
+			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
+		}
+		if (resolved.error || !resolved.model) {
+			throw new Error(resolved.error ?? `Model "${parsed.planYoloInto ?? "@smol"}" not found`);
+		}
+		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
+			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
+		}
+		options.planYolo = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
 	}
 
 	// Thinking level
@@ -963,11 +1061,12 @@ interface RunRootCommandDependencies {
 	settings?: Settings;
 	forceSetupWizard?: boolean;
 }
+const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
-	deps: RunRootCommandDependencies = {},
+	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
 	logger.startTiming();
 	startStartupWatchdog();
@@ -1009,6 +1108,9 @@ export async function runRootCommand(
 		process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 		process.exit(1);
 	}
+	const mode = parsedArgs.mode || "text";
+	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
+	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
 	// Kick off plugin-root preload in parallel with the remaining startup work.
 	// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -1055,12 +1157,15 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
-	const mode = parsedArgs.mode || "text";
 	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
 	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
 	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+	// Only the interactive host renders a focusable Agent Hub / subagent session
+	// tree; declare it so headless subagent optimizations (e.g. skipping replan
+	// title refresh) can tell a focusable process from a print/RPC/eval one.
+	setInteractiveHost(isInteractive);
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
@@ -1113,8 +1218,14 @@ export async function runRootCommand(
 			modelPatterns,
 			modelRegistry,
 			modelMatchPreferences,
+			settingsInstance,
 		);
 	}
+
+	// Resolve an explicit `--continue <id>` before extension flags are loaded.
+	// Reading the token immediately after `--continue` distinguishes the session
+	// id from UUID-shaped values owned by later extension flags.
+	normalizeContinueSessionArgs(parsedArgs, rawArgs);
 
 	// Create session manager based on CLI flags. SessionResolutionError signals a
 	// user-facing failure (unknown --resume/--fork id, non-interactive fork
@@ -1224,6 +1335,9 @@ export async function runRootCommand(
 	}
 
 	await pluginPreloadPromise;
+	if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
+	}
 
 	scheduleMarketplaceAutoUpdate({
 		autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
@@ -1245,15 +1359,13 @@ export async function runRootCommand(
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
 
-	// OTEL: register the global OTLP trace exporter when an OTLP endpoint is
-	// configured via env, then switch on the agent loop's telemetry so its
-	// GenAI spans (invoke_agent / chat / execute_tool) are actually emitted.
-	// Both are no-ops when OTEL_EXPORTER_OTLP_ENDPOINT is unset. An empty config
-	// is enough to enable telemetry — content capture is governed by the
-	// standard OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT env var.
+	// OTEL: register global OTLP exporters when an endpoint is configured via
+	// env, then switch on the agent loop's telemetry hooks so traces, run-level
+	// metrics, and structured logs have source events to export. Content capture
+	// remains governed by OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
 	await logger.time("initTelemetryExport", initTelemetryExport);
 	if (isTelemetryExportEnabled()) {
-		sessionOptions.telemetry = {};
+		sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
 	}
 
 	// Handle CLI --api-key as runtime override (not persisted)
@@ -1302,6 +1414,10 @@ export async function runRootCommand(
 		// string-flag value such as `--target @notes.md` is the flag's value, not a
 		// file — and the same result is handed to createAgentSession via
 		// `preloadedExtensions` so the discovery work is not repeated.
+		if (isInteractive) {
+			sessionOptions.extensions = [...(sessionOptions.extensions ?? []), createWarpEventBridgeExtension()];
+		}
+
 		const eventBus = new EventBus();
 		const extensionsResult = await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
 		const extensionFlagSink: ExtensionFlagSink = {
@@ -1311,6 +1427,14 @@ export async function runRootCommand(
 			},
 		};
 		const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
+		normalizeContinueSessionArgs(initialArgs, rawArgs);
+		for (const message of formatExtensionLoadNotifications(extensionsResult.errors)) {
+			if (isInteractive) {
+				notifs.push({ kind: "warn", message });
+			} else {
+				process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
+			}
+		}
 		// Fail fast on stale/typo flags (e.g. `omp --list-models`) now that we
 		// know the real extension flag set. Without this check the unrecognized
 		// token gets silently consumed and any following positional leaks as the
@@ -1400,7 +1524,7 @@ export async function runRootCommand(
 			// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus);
+			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const changelogMarkdown = await logger.time("main:getChangelogForDisplay", getChangelogForDisplay, parsedArgs);
