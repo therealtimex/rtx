@@ -27,8 +27,12 @@ export function resolveCrossBuild(value: string | undefined): CrossBuild | null 
 			return { id: value, platform: "darwin", arch: "x64", target: "bun-darwin-x64" };
 		case "linux-arm64":
 			return { id: value, platform: "linux", arch: "arm64", target: "bun-linux-arm64" };
+		case "linux-musl-arm64":
+			return { id: value, platform: "linux", arch: "arm64", target: "bun-linux-arm64-musl" };
 		case "linux-x64":
 			return { id: value, platform: "linux", arch: "x64", target: "bun-linux-x64-baseline" };
+		case "linux-musl-x64":
+			return { id: value, platform: "linux", arch: "x64", target: "bun-linux-x64-musl" };
 		case "win32-x64":
 		case "windows-x64":
 			return { id: value, platform: "win32", arch: "x64", target: "bun-windows-x64-baseline" };

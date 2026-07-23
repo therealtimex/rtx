@@ -1,6 +1,6 @@
 # Build self-contained `rtx` binaries on GitHub-hosted runners and publish them
 # as release assets. Asset names match what the installers download:
-#   scripts/install.sh  -> rtx-<darwin|linux>-<x64|arm64>
+#   scripts/install.sh  -> rtx-<darwin|linux|linux-musl>-<x64|arm64>
 #   scripts/install.ps1 -> rtx-windows-x64.exe
 #
 # Stages per job (the flow proven to build locally in R1):
@@ -50,6 +50,19 @@ jobs:
             asset: rtx-linux-arm64
             dual_tier: false
             linux: true
+          - os: ubuntu-latest
+            asset: rtx-linux-musl-x64
+            cross_target: linux-musl-x64
+            native_cross_target: x86_64-unknown-linux-musl
+            dual_tier: false
+            linux: true
+            x64: true
+          - os: ubuntu-latest
+            asset: rtx-linux-musl-arm64
+            cross_target: linux-musl-arm64
+            native_cross_target: aarch64-unknown-linux-musl
+            dual_tier: false
+            linux: true
           - os: windows-latest
             asset: rtx-windows-x64.exe
             dual_tier: false
@@ -68,6 +81,12 @@ jobs:
             pkg-config libx11-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libdbus-1-dev
 
+      - name: Install Linux musl cross deps
+        if: ${{ matrix.native_cross_target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -75,6 +94,20 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.native_cross_target }}
+
+      - name: Setup zig for musl cross build
+        if: ${{ matrix.native_cross_target }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild for musl cross build
+        if: ${{ matrix.native_cross_target }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Install dependencies
         run: bun install
@@ -84,9 +117,16 @@ jobs:
       # platforms build baseline, which the loader falls back to everywhere.
       - name: Build native addon(s)
         working-directory: packages/natives
+        env:
+          CROSS_TARGET: ${{ matrix.native_cross_target }}
+          TARGET_PLATFORM: ${{ matrix.cross_target && 'linux' || '' }}
+          TARGET_ARCH: ${{ matrix.x64 && 'x64' || matrix.native_cross_target && 'arm64' || '' }}
+          RUSTFLAGS: ${{ matrix.x64 && '-C target-cpu=x86-64-v2' || '' }}
         run: |
           if [ "${{ matrix.dual_tier }}" = "true" ]; then
             TARGET_VARIANT=modern bun run build
+            TARGET_VARIANT=baseline bun run build
+          elif [ "${{ matrix.x64 }}" = "true" ]; then
             TARGET_VARIANT=baseline bun run build
           else
             bun run build
@@ -121,11 +161,14 @@ jobs:
 
       - name: Compile self-contained binary
         working-directory: packages/coding-agent
+        env:
+          CROSS_TARGET: ${{ matrix.cross_target }}
         run: bun run build
 
       - name: Stage release asset
         run: |
           src="packages/coding-agent/dist/rtx"
+          [ -n "${{ matrix.cross_target }}" ] && src="packages/coding-agent/dist/${{ matrix.asset }}"
           [ "${{ matrix.windows }}" = "true" ] && src="packages/coding-agent/dist/rtx.exe"
           mv "$src" "${{ matrix.asset }}"
           chmod +x "${{ matrix.asset }}" || true
