@@ -5,6 +5,12 @@
 ### Changed
 
 - Rebranded the default app/config directory constants from `omp`/`.omp` to `rtx`/`.rtx`.
+## [17.0.9] - 2026-07-23
+
+### Breaking Changes
+
+- Renamed `getAutoQaDbDir` to `getAutoQaDbPath` for accuracy; update any usage accordingly
+
 ## [17.0.5] - 2026-07-18
 
 ### Changed
