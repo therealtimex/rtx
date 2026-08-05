@@ -13,6 +13,7 @@ import { $ } from "bun";
 import chalk from "chalk";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
+import { fetchLatestRtxRelease } from "./rtx-release";
 
 const REPO = "therealtimex/rtx";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
@@ -263,13 +264,19 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 }
 
 /**
- * Get the latest release info from the npm registry.
- * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
+ * Get the latest release info from this fork's own GitHub releases.
+ *
+ * MUST stay pointed at {@link REPO} (therealtimex/rtx), not upstream's
+ * can1357/oh-my-pi repo or its `@oh-my-pi/pi-coding-agent` npm package: this
+ * fork stamps its own small release-tag semver into `VERSION` at build time,
+ * a completely different numbering line from upstream's. Comparing against
+ * upstream's releases/npm package always looks like an update is available
+ * and then 404s trying to download a release tag this fork never published.
  */
 async function getLatestRelease(): Promise<ReleaseInfo> {
-	let response: Response;
+	let release: Awaited<ReturnType<typeof fetchLatestRtxRelease>>;
 	try {
-		response = await fetch(`${NPM_REGISTRY}${PACKAGE}/latest`, {
+		release = await fetchLatestRtxRelease(fetch, {
 			signal: withTimeoutSignal(RELEASE_METADATA_TIMEOUT_MS),
 		});
 	} catch (err) {
@@ -278,18 +285,8 @@ async function getLatestRelease(): Promise<ReleaseInfo> {
 		}
 		throw err;
 	}
-	if (!response.ok) {
-		throw new Error(`Failed to fetch release info: ${response.statusText}`);
-	}
 
-	const data = (await response.json()) as { version: string };
-	const version = data.version;
-	const tag = `v${version}`;
-
-	return {
-		tag,
-		version,
-	};
+	return { tag: release.tag, version: release.version };
 }
 
 /**

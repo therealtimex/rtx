@@ -22,6 +22,7 @@ import {
 	replaceBinaryForUpdate,
 	resolveBunGlobalNodeModulesDirFromLocations,
 	resolveUpdateMethodForTest,
+	runUpdateCommand,
 	sweepStaleBackups,
 } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import Update from "@oh-my-pi/pi-coding-agent/commands/update";
@@ -129,6 +130,30 @@ describe("rtx GitHub release metadata", () => {
 			prerelease: false,
 			assets: [{ name: "rtx-darwin-arm64", browser_download_url: "https://example.test/rtx-darwin-arm64" }],
 		});
+	});
+
+	it("queries this fork's own GitHub releases feed for the update check, not upstream's npm package or repo", async () => {
+		// Regression: a routine upstream-sync merge once silently reverted
+		// `getLatestRelease` to upstream can1357/oh-my-pi's own npm package.
+		// This fork stamps a completely different version scheme into
+		// `VERSION` at build time, so that always looked like an update was
+		// available and then 404ed trying to download a release tag
+		// therealtimex/rtx never published. Pin the exact endpoint so a
+		// future sync merge cannot reintroduce that silently.
+		let requestUrl: string | undefined;
+		spyOn(console, "log").mockImplementation(() => {});
+		const fetchStub = Object.assign(
+			async (input: string | URL | Request) => {
+				requestUrl = String(input);
+				return Response.json({ tag_name: "v999.0.0", prerelease: false, assets: [] });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+
+		await runUpdateCommand({ force: false, check: true });
+
+		expect(requestUrl).toBe("https://api.github.com/repos/therealtimex/rtx/releases/latest");
 	});
 });
 

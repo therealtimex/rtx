@@ -102,9 +102,13 @@ function parseGithubReleasePayload(payload: GithubReleasePayload): RtxReleaseInf
 	};
 }
 
-export async function fetchLatestRtxRelease(fetchImpl: typeof fetch = fetch): Promise<RtxReleaseInfo> {
+export async function fetchLatestRtxRelease(
+	fetchImpl: typeof fetch = fetch,
+	init?: RequestInit,
+): Promise<RtxReleaseInfo> {
 	const response = await fetchImpl(`https://api.github.com/repos/${RTX_RELEASE_REPO}/releases/latest`, {
-		headers: { Accept: "application/vnd.github+json" },
+		...init,
+		headers: { Accept: "application/vnd.github+json", ...init?.headers },
 	});
 	if (!response.ok) {
 		throw new Error(`Failed to fetch latest GitHub release: ${response.statusText}`);
