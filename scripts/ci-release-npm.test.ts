@@ -45,8 +45,6 @@ describe("release npm packages", () => {
 		expect(await Bun.file(path.join(outDir, "packages", "win32-x64", "bin", "rtx.exe")).text()).toBe(
 			"rtx-windows-x64.exe",
 		);
-		const muslPackage = await Bun.file(path.join(outDir, "packages", "linux-musl-x64", "package.json")).json();
-		expect(muslPackage.libc).toEqual(["musl"]);
 	});
 
 	it("rejects versions that npm cannot publish", async () => {

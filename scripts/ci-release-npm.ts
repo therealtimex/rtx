@@ -58,22 +58,6 @@ export const releaseTargets: readonly ReleaseTarget[] = [
 		libc: "glibc",
 	},
 	{
-		asset: "rtx-linux-musl-arm64",
-		packageSuffix: "linux-musl-arm64",
-		os: "linux",
-		cpu: "arm64",
-		binary: "rtx",
-		libc: "musl",
-	},
-	{
-		asset: "rtx-linux-musl-x64",
-		packageSuffix: "linux-musl-x64",
-		os: "linux",
-		cpu: "x64",
-		binary: "rtx",
-		libc: "musl",
-	},
-	{
 		asset: "rtx-windows-x64.exe",
 		packageSuffix: "win32-x64",
 		os: "win32",
