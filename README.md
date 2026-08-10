@@ -49,7 +49,7 @@ brew install therealtimex/tap/rtx
 **Bun (recommended)**
 
 ```sh
-bun install -g @oh-my-pi/pi-coding-agent
+npm install -g @realtimex/rtx
 ```
 
 **Windows (PowerShell)**
