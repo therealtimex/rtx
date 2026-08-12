@@ -899,9 +899,9 @@ describe("update-cli script-shim takeover", () => {
 	}
 
 	const shims: Record<string, string> = {
-		omp: "#!/bin/sh\nnode omp.js\n",
-		"omp.cmd": "@node omp.js %*\n",
-		"omp.ps1": "node omp.js @args\n",
+		rtx: "#!/bin/sh\nnode rtx.js\n",
+		"rtx.cmd": "@node rtx.js %*\n",
+		"rtx.ps1": "node rtx.js @args\n",
 	};
 
 	async function writeShims(dir: string): Promise<void> {
@@ -910,21 +910,21 @@ describe("update-cli script-shim takeover", () => {
 		}
 	}
 
-	it("installs omp.exe beside the shims and retires them", async () => {
+	it("installs rtx.exe beside the shims and retires them", async () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
 		// Real executable, no injected verifier: the takeover must verify the
 		// exe by explicit path — $which cached the shim path before it was
 		// renamed away, so a PATH re-resolution would fail here.
-		const exe = `#!/bin/sh\necho omp/${version}\n`;
+		const exe = `#!/bin/sh\necho rtx/${version}\n`;
 
-		await updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
+		await updateViaShimTakeover(path.join(dir, "rtx.cmd"), version, {
 			binaryName,
 			fetchImpl: makeFetch(exe),
 			githubToken: "test-token",
 		});
 
-		expect(await Bun.file(path.join(dir, "omp.exe")).text()).toBe(exe);
+		expect(await Bun.file(path.join(dir, "rtx.exe")).text()).toBe(exe);
 		for (const name in shims) {
 			expect(await Bun.file(path.join(dir, name)).exists()).toBe(false);
 		}
@@ -936,17 +936,17 @@ describe("update-cli script-shim takeover", () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
 		// Executable runs but reports the previous version -> full rollback.
-		const exe = "#!/bin/sh\necho omp/17.2.12\n";
+		const exe = "#!/bin/sh\necho rtx/17.2.12\n";
 
 		await expect(
-			updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
+			updateViaShimTakeover(path.join(dir, "rtx.cmd"), version, {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
 			}),
-		).rejects.toThrow(/still reports 17\.2\.12 \(expected 18\.0\.0\); restored previous omp launcher/);
+		).rejects.toThrow(/still reports 17\.2\.12 \(expected 18\.0\.0\); restored previous rtx launcher/);
 
-		expect(await Bun.file(path.join(dir, "omp.exe")).exists()).toBe(false);
+		expect(await Bun.file(path.join(dir, "rtx.exe")).exists()).toBe(false);
 		for (const name in shims) {
 			expect(await Bun.file(path.join(dir, name)).text()).toBe(shims[name]);
 		}
@@ -957,7 +957,7 @@ describe("update-cli script-shim takeover", () => {
 	function renameLockingPs1(): Mock<typeof nodeFs.promises.rename> {
 		const realRename = nodeFs.promises.rename;
 		return spyOn(nodeFs.promises, "rename").mockImplementation(async (from, to) => {
-			if (path.basename(String(from)) === "omp.ps1") {
+			if (path.basename(String(from)) === "rtx.ps1") {
 				throw Object.assign(new Error("EPERM: file is locked"), { code: "EPERM" });
 			}
 			return await realRename(from, to);
@@ -967,10 +967,10 @@ describe("update-cli script-shim takeover", () => {
 	it("rewrites an immovable precedence-winning shim as a forwarder to the exe", async () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
-		const exe = `#!/bin/sh\necho omp/${version}\n`;
+		const exe = `#!/bin/sh\necho rtx/${version}\n`;
 		const renameSpy = renameLockingPs1();
 		try {
-			await updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
+			await updateViaShimTakeover(path.join(dir, "rtx.cmd"), version, {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
@@ -979,32 +979,32 @@ describe("update-cli script-shim takeover", () => {
 			renameSpy.mockRestore();
 		}
 
-		expect(await Bun.file(path.join(dir, "omp.exe")).text()).toBe(exe);
-		expect(await Bun.file(path.join(dir, "omp")).exists()).toBe(false);
-		expect(await Bun.file(path.join(dir, "omp.cmd")).exists()).toBe(false);
+		expect(await Bun.file(path.join(dir, "rtx.exe")).text()).toBe(exe);
+		expect(await Bun.file(path.join(dir, "rtx")).exists()).toBe(false);
+		expect(await Bun.file(path.join(dir, "rtx.cmd")).exists()).toBe(false);
 		// PowerShell resolves .ps1 before .exe: the locked shim must now exec
 		// the new binary instead of keeping its old body.
-		expect(await Bun.file(path.join(dir, "omp.ps1")).text()).toContain('& "$PSScriptRoot\\omp.exe" @args');
+		expect(await Bun.file(path.join(dir, "rtx.ps1")).text()).toContain('& "$PSScriptRoot\\rtx.exe" @args');
 	});
 
 	it("restores a forwarded shim's original body when verification fails", async () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
-		const exe = "#!/bin/sh\necho omp/17.2.12\n";
+		const exe = "#!/bin/sh\necho rtx/17.2.12\n";
 		const renameSpy = renameLockingPs1();
 		try {
 			await expect(
-				updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
+				updateViaShimTakeover(path.join(dir, "rtx.cmd"), version, {
 					binaryName,
 					fetchImpl: makeFetch(exe),
 					githubToken: "test-token",
 				}),
-			).rejects.toThrow("restored previous omp launcher");
+			).rejects.toThrow("restored previous rtx launcher");
 		} finally {
 			renameSpy.mockRestore();
 		}
 
-		expect(await Bun.file(path.join(dir, "omp.exe")).exists()).toBe(false);
+		expect(await Bun.file(path.join(dir, "rtx.exe")).exists()).toBe(false);
 		for (const name in shims) {
 			expect(await Bun.file(path.join(dir, name)).text()).toBe(shims[name]);
 		}
