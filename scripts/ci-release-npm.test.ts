@@ -33,9 +33,7 @@ describe("release npm packages", () => {
 			Object.fromEntries(releaseTargets.map(target => [`@realtimex/rtx-${target.packageSuffix}`, "1.2.3"])),
 		);
 
-		const windowsPackage = await Bun.file(
-			path.join(outDir, "packages", "win32-x64", "package.json"),
-		).json();
+		const windowsPackage = await Bun.file(path.join(outDir, "packages", "win32-x64", "package.json")).json();
 		expect(windowsPackage).toMatchObject({
 			name: "@realtimex/rtx-win32-x64",
 			version: "1.2.3",
