@@ -240,7 +240,7 @@ export class WelcomeComponent implements Component {
 		}
 		const dualContentWidth = boxWidth - 3; // 3 = │ + │ + │
 		const preferredLeftCol = 26;
-		const minLeftCol = 12; // logo width
+		const minLeftCol = 17; // logo width
 		const minRightCol = 20;
 		const leftMinContentWidth = Math.max(
 			minLeftCol,
@@ -450,7 +450,13 @@ export class WelcomeComponent implements Component {
 	}
 }
 
-export const PI_LOGO = ["██╗  ██╗    ", "╚██╗██╔╝    ", " ╚███╔╝     ", " ██╔██╗     ", "██╔╝ ╚██╗   "];
+export const PI_LOGO = [
+	" ____ _______  __",
+	"|  _ \\_   _\\ \\/ /",
+	"| |_) || |  \\  / ",
+	"|  _ < | |  /  \\ ",
+	"|_| \\_\\|_| /_/\\_\\",
+];
 
 /** Multi-stop palette for the diagonal gradient. */
 const GRADIENT_STOPS: ReadonlyArray<readonly [number, number, number]> = [
