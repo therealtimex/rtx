@@ -23,13 +23,13 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
-import { type Args, reportUnrecognizedFlags } from "./cli/args";
+import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
-import { fetchLatestRtxReleaseVersion } from "./cli/rtx-release";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
+import { getLatestRelease } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -75,6 +75,7 @@ import {
 	loadSessionExtensions,
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
+import { describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import {
@@ -114,13 +115,8 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 		return;
 	}
 	try {
-		const latestVersion = await fetchLatestRtxReleaseVersion();
-
-		if (latestVersion && Bun.semver.order(latestVersion, currentVersion) > 0) {
-			return latestVersion;
-		}
-
-		return undefined;
+		const release = await getLatestRelease({ timeoutMs: 5_000 });
+		return Bun.semver.order(release.version, currentVersion) > 0 ? release.version : undefined;
 	} catch {
 		return undefined;
 	}
@@ -140,6 +136,7 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"task.disabledAgents",
 	"task.agentModelOverrides",
 	"task.agentPrewalk",
+	"task.agentAdvisor",
 	// Memory subsystems are off-by-default for RPC/ACP hosts; embedders that want
 	// memory should opt in explicitly through their own settings layer.
 	"memory.backend",
@@ -148,7 +145,6 @@ const HOST_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	// instead of inheriting a user's globally-enabled local preference, and when
 	// they do opt in they get the default tuning rather than the user's local tuning.
 	"advisor.enabled",
-	"advisor.subagents",
 	"advisor.syncBacklog",
 	"advisor.immuneTurns",
 	"tier.advisor",
@@ -159,6 +155,8 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"async.maxJobs",
 	"bash.autoBackground.enabled",
 	"bash.autoBackground.thresholdMs",
+	"eval.autoBackground.enabled",
+	"eval.autoBackground.thresholdMs",
 ];
 
 // Protocol-mode hosts opt into a small set of paths whose host-default we
@@ -353,7 +351,7 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions">;
+	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
@@ -429,7 +427,27 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
 		}
-		applyExtensionFlags(nextSession.extensionRunner, args.rawArgs);
+		const runner = nextSession.extensionRunner;
+		const reparsedArgs = applyExtensionFlags(
+			runner
+				? {
+						getFlags: () => runner.getFlags(),
+						setFlagValue: (name, value) => {
+							runner.setFlagValue(name, value);
+						},
+					}
+				: undefined,
+			args.rawArgs,
+		);
+		const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
+		if (requestedTools) {
+			try {
+				validateToolNames(requestedTools, nextSession.getAllToolNames());
+			} catch (error) {
+				await nextSession.dispose();
+				throw error;
+			}
+		}
 		return nextSession;
 	};
 }
@@ -495,23 +513,24 @@ async function runInteractiveMode(
 		await setupWizard.runSetupWizard(mode, setupScenes);
 	}
 
-	versionCheckPromise
-		.then(newVersion => {
-			if (!settings.get("startup.checkUpdate")) {
-				return;
-			}
-			if (newVersion) {
-				mode.showNewVersionNotification(newVersion);
-			}
-		})
-		.catch(() => {});
+	// Consume failures immediately, but defer any banner until the transcript is stable.
+	const checkedVersionPromise = versionCheckPromise.catch(() => undefined);
 
 	// Cold-launch cleanup: the first paint already clears native history, and this
 	// replay replaces the welcome/startup frame with the resumed/new transcript.
 	// Every in-process session load also uses `clearTerminalHistory`; cold launch
 	// follows the same clean-cutover path instead of preserving a previous run's
 	// transcript above the fresh one.
-	mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
+	await mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
+	// A resolved version check must not insert its banner into a partial transcript.
+	checkedVersionPromise.then(newVersion => {
+		if (!settings.get("startup.checkUpdate")) {
+			return;
+		}
+		if (newVersion) {
+			mode.showNewVersionNotification(newVersion);
+		}
+	});
 
 	for (const notify of notifs) {
 		if (!notify) {
@@ -1270,9 +1289,18 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
+	// Create AuthStorage upfront. A configured-but-unreachable auth broker throws
+	// here; convert it to an actionable stderr message + clean exit instead of a
+	// raw uncaught stack trace (issue #8096).
+	let authStorage: AuthStorage;
+	try {
+		authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
+	} catch (error) {
+		const message = await describeAuthBrokerStartupError(error);
+		if (message === null) throw error;
+		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+		process.exit(1);
+	}
 
 	const settingsInstance =
 		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
@@ -1290,6 +1318,13 @@ export async function runRootCommand(
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
+
+	// The registry composes policy-dependent metadata synchronously, including
+	// extended-context window caps, so it must receive the finalized settings.
+	const modelRegistry = logger.time(
+		"modelRegistry:init",
+		() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
+	);
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
@@ -1678,6 +1713,13 @@ export async function runRootCommand(
 			preloadedExtensions: extensionsResult,
 		});
 
+		try {
+			validateToolNames(initialArgs.tools, session.getAllToolNames());
+		} catch (error) {
+			await session.dispose();
+			throw error;
+		}
+
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
 		// reviver, so `ensureLive` (IRC sends, hub focus) would refuse it. Install a
@@ -1781,6 +1823,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				printThoughts: initialArgs.printThoughts,
+				planYolo: parsedArgs.planYolo,
 			});
 			if ($env.PI_TIMING) {
 				logger.printTimings();
